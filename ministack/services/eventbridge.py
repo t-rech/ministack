@@ -192,7 +192,8 @@ def restore_state(data):
                 rule["CreationTime"] = _coerce_timestamp(rule["CreationTime"])
 
         for rep in _replays.all_values():
-            for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime"):
+            for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime",
+                       "EventLastReplayedTime"):
                 if tk in rep and rep[tk] is not None:
                     rep[tk] = _coerce_timestamp(rep[tk])
             # Replays whose dispatch thread was running at shutdown can't
@@ -670,6 +671,9 @@ def _put_targets(data):
         error = _validate_target_arn(target)
         if error:
             return error
+        error = _validate_target_dead_letter_config(target)
+        if error:
+            return error
         if "Input" in target:
             # AWS validates static Input at PutTargets time — it must be valid
             # JSON text, not at delivery.
@@ -718,6 +722,29 @@ def _validate_target_arn(target):
     ):
         return error_response_json("ValidationException", "RoleArn is required", 400)
 
+    return None
+
+
+def _validate_target_dead_letter_config(target):
+    """AWS validates at PutTargets that DeadLetterConfig.Arn is an SQS queue
+    ARN; whether the queue exists (or is FIFO) only surfaces at delivery."""
+    arn = ((target.get("DeadLetterConfig") or {}).get("Arn") or "").strip()
+    if not arn:
+        return None
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {arn} is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+    if spec.service != "sqs":
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {arn} is not valid. Reason: DeadLetterConfig Arn must be an SQS queue Arn.",
+            400,
+        )
     return None
 
 
@@ -1044,6 +1071,10 @@ def _put_events(data):
 
 
 def _archive_event(event, view=None):
+    # AWS parity (CreateArchive API reference): "Replayed events are not sent
+    # to an archive" — the managed archive rule never matches them.
+    if event.get("ReplayName"):
+        return
     bus_name = event.get("EventBusName", "default")
     bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
     for archive in _archives.values():
@@ -1057,15 +1088,18 @@ def _archive_event(event, view=None):
                 continue
         archive.setdefault("Events", []).append(event)
         archive["EventCount"] = archive.get("EventCount", 0) + 1
+        archive["SizeBytes"] = archive.get("SizeBytes", 0) + len(json.dumps(event))
 
 
-def _dispatch_event(event, view=None):
+def _dispatch_event(event, view=None, only_rule_arns=None):
     bus_name = event.get("EventBusName", "default")
     event_path = set(event.get("_DispatchPath") or [])
     view = view or _pattern_event_view(event)
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
+            continue
+        if only_rule_arns is not None and rule.get("Arn") not in only_rule_arns:
             continue
         if key in event_path:
             logger.warning("EventBridge: recursive rule dispatch skipped for %s", key)
@@ -2271,7 +2305,9 @@ def _invoke_target(target, event, rule, view=None):
     if target_input_payload is not None:
         event_payload = target_input_payload
 
+    dlq = None
     try:
+        dlq = _resolve_target_dlq(target, rule, envelope_payload)
         try:
             spec = parse_arn(arn)
         except ArnParseError:
@@ -2280,12 +2316,12 @@ def _invoke_target(target, event, rule, view=None):
 
         if spec.service == "events" and spec.resource.startswith("api-destination/"):
             _dispatch_to_api_destination(
-                spec, event_payload, target, rule, envelope_payload, transformer_input_invalid
+                spec, event_payload, target, rule, dlq, transformer_input_invalid
             )
         elif spec.service == "events":
-            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
+            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload, dlq)
         elif spec.service == "states":
-            _dispatch_to_stepfunctions(arn, event_payload)
+            _dispatch_to_stepfunctions(arn, event_payload, dlq)
         elif not _target_matches_request_scope(spec):
             # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
             # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
@@ -2298,17 +2334,19 @@ def _invoke_target(target, event, rule, view=None):
                 arn,
             )
         elif spec.service == "lambda":
-            _dispatch_to_lambda(arn, event_payload)
+            _dispatch_to_lambda(arn, event_payload, dlq)
         elif spec.service == "sqs":
-            _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+            _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {}, dlq)
         elif spec.service == "sns":
-            _dispatch_to_sns(arn, event_payload)
+            _dispatch_to_sns(arn, event_payload, dlq)
         elif spec.service == "logs":
-            _dispatch_to_logs(spec, event_payload)
+            _dispatch_to_logs(spec, event_payload, dlq)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "INTERNAL_ERROR", str(e))
 
 
 def _target_matches_request_scope(spec) -> bool:
@@ -2316,7 +2354,7 @@ def _target_matches_request_scope(spec) -> bool:
     return spec.account_id == get_account_id() and spec.region == get_region()
 
 
-def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):
+def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None, dlq=None):
     if spec.service != "events" or not spec.resource.startswith("event-bus/"):
         logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
         return
@@ -2328,6 +2366,8 @@ def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=N
     bus_name = spec.resource.split("/", 1)[1]
     if bus_name not in _event_buses:
         logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"Event bus {bus_name} does not exist.")
         return
     source_rule_key = _rule_key(rule.get("Name"), rule.get("EventBusName", "default"))
     if source_rule_key in event_path:
@@ -2420,7 +2460,7 @@ def _apply_input_transformer(transformer, rule, view):
     return result, not _object_variable_positions_valid(template, object_vars)
 
 
-def _dispatch_to_lambda(arn, payload):
+def _dispatch_to_lambda(arn, payload, dlq=None):
     from ministack.services import lambda_svc
 
     try:
@@ -2431,6 +2471,9 @@ def _dispatch_to_lambda(arn, payload):
     func, config, func_name = lambda_svc._get_func_record_for_ref(arn)
     if not func or not config:
         logger.warning("EventBridge → Lambda: function %s not found", func_name)
+        if dlq is not None:
+            # A missing target resource dead-letters without retry attempts.
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"Function not found: {arn}")
         return
     exec_record = lambda_svc._execution_record_for_config(func, config)
     threading.Thread(
@@ -2439,7 +2482,7 @@ def _dispatch_to_lambda(arn, payload):
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
 
 
-def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
+def _dispatch_to_sqs(spec, payload, sqs_parameters=None, dlq=None):
     """Dispatch an EventBridge event to an SQS queue.
 
     ``sqs_parameters`` carries the target's ``SqsParameters`` block from the
@@ -2455,6 +2498,8 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("EventBridge → SQS: queue %s not found", queue_name)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", "The specified queue does not exist.")
         return
 
     sqs_parameters = sqs_parameters or {}
@@ -2499,12 +2544,14 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     logger.info("EventBridge → SQS %s", queue_name)
 
 
-def _dispatch_to_sns(arn, payload):
+def _dispatch_to_sns(arn, payload, dlq=None):
     from ministack.services import sns as _sns
 
     topic = _sns._topics.get(arn)
     if not topic:
         logger.warning("EventBridge → SNS: topic %s not found", arn)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", "Topic does not exist")
         return
 
     msg_id = new_uuid()
@@ -2518,7 +2565,7 @@ def _dispatch_to_sns(arn, payload):
     logger.info("EventBridge → SNS %s", arn)
 
 
-def _dispatch_to_stepfunctions(arn, payload):
+def _dispatch_to_stepfunctions(arn, payload, dlq=None):
     from ministack.services import stepfunctions as _sfn
 
     # Accept all three SFN target ARN shapes EventBridge supports in real
@@ -2527,6 +2574,8 @@ def _dispatch_to_stepfunctions(arn, payload):
     # any state machine the caller's account can see.
     if _sfn._resolve_state_machine_arn(arn) is None:
         logger.warning("EventBridge → Step Functions: state machine %s not found", arn)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"State Machine Does Not Exist: '{arn}'")
         return
 
     sm_name = arn.rsplit(":", 1)[-1]
@@ -2924,7 +2973,7 @@ def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key,
             _send_to_target_dlq(dlq, "ERROR_FROM_TARGET", f"HTTP {status}")
 
 
-def _dispatch_to_api_destination(spec, payload, target, rule, envelope_payload, input_invalid=False):
+def _dispatch_to_api_destination(spec, payload, target, rule, dlq=None, input_invalid=False):
     if spec.account_id != get_account_id() or spec.region != get_region():
         logger.warning(
             "EventBridge → API destination: %s is outside the current account/region scope", spec
@@ -2935,8 +2984,9 @@ def _dispatch_to_api_destination(spec, payload, target, rule, envelope_payload, 
     dest = _api_destinations.get(name)
     if not dest:
         logger.warning("EventBridge → API destination: %s not found", name)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"API destination {name} does not exist.")
         return
-    dlq = _resolve_target_dlq(target, rule, envelope_payload)
     if input_invalid:
         # Live-verified AWS behavior: an InputTransformer placing an object
         # variable outside a JSON value position fails the invocation BEFORE
@@ -2994,7 +3044,7 @@ def _dispatch_to_api_destination(spec, payload, target, rule, envelope_payload, 
     ).start()
 
 
-def _dispatch_to_logs(spec, payload):
+def _dispatch_to_logs(spec, payload, dlq=None):
     """Deliver one matched event into a CloudWatch Logs log-group target. Real
     EventBridge creates an opaque-named log stream and writes the (input-
     selected) event as the log line; authorization via the logs resource
@@ -3010,6 +3060,8 @@ def _dispatch_to_logs(spec, payload):
         group_name = group_name[:-2]
     if group_name not in _logs._log_groups:
         logger.warning("EventBridge → CloudWatch Logs: log group %s not found", group_name)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", "The specified log group does not exist.")
         return
     stream_name = new_uuid()
     _logs._create_log_stream({"logGroupName": group_name, "logStreamName": stream_name})
@@ -3085,14 +3137,47 @@ def _create_archive(data):
         return _invalid_event_pattern(pattern_error)
 
     source_arn = data.get("EventSourceArn", "")
+    if not source_arn or not source_arn.startswith("arn:"):
+        return error_response_json(
+            "ValidationException",
+            "Parameter EventSourceArn is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+    bus_name, bus_error = _event_bus_name_from_ref(source_arn)
+    if bus_error:
+        code, message = bus_error
+        return error_response_json(code, message, 400)
+    if bus_name not in _event_buses:
+        return error_response_json(
+            "ResourceNotFoundException", f"Event bus {bus_name} does not exist.", 400
+        )
+
+    pattern = data.get("EventPattern", "")
+    if pattern:
+        try:
+            json.loads(pattern)
+        except (TypeError, json.JSONDecodeError):
+            return error_response_json(
+                "InvalidEventPatternException", "Event pattern is not valid JSON", 400
+            )
+
+    retention = int(data.get("RetentionDays") or 0)
+    if retention < 0:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{retention}' at 'retentionDays' failed to satisfy "
+            "constraint: Member must have value greater than or equal to 0",
+            400,
+        )
+
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:archive/{name}"
     _archives[name] = {
         "ArchiveName": name,
         "ArchiveArn": arn,
         "EventSourceArn": source_arn,
         "Description": data.get("Description", ""),
-        "EventPattern": data.get("EventPattern", ""),
-        "RetentionDays": data.get("RetentionDays", 0),
+        "EventPattern": pattern,
+        "RetentionDays": retention,
         "State": "ENABLED",
         "CreationTime": _now_ts(),
         "EventCount": 0,
@@ -3143,7 +3228,15 @@ def _update_archive(data):
             return _invalid_event_pattern(pattern_error)
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
-        archive["RetentionDays"] = int(data["RetentionDays"])
+        retention = int(data["RetentionDays"] or 0)
+        if retention < 0:
+            return error_response_json(
+                "ValidationException",
+                f"1 validation error detected: Value '{retention}' at 'retentionDays' failed to satisfy "
+                "constraint: Member must have value greater than or equal to 0",
+                400,
+            )
+        archive["RetentionDays"] = retention
     if "KmsKeyIdentifier" in data:
         archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
 
@@ -3179,6 +3272,14 @@ def _start_replay(data):
     name = data.get("ReplayName")
     if not name:
         return error_response_json("ValidationException", "ReplayName is required", 400)
+    if len(name) > 64:
+        # AWS caps replay names at 64 chars.
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'replayName' failed to satisfy constraint: "
+            "Member must have length less than or equal to 64",
+            400,
+        )
     if name in _replays:
         return error_response_json(
             "ResourceAlreadyExistsException",
@@ -3192,6 +3293,10 @@ def _start_replay(data):
             "Destination.Arn is required",
             400,
         )
+    # Both window bounds are required members on the live API.
+    for member in ("EventStartTime", "EventEndTime"):
+        if data.get(member) is None:
+            return error_response_json("ValidationException", f"{member} is required", 400)
 
     source_arn = data.get("EventSourceArn", "")
     archive_name, source_error = _archive_name_from_ref(source_arn)
@@ -3218,8 +3323,22 @@ def _start_replay(data):
 
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:replay/{name}"
     now = _now_ts()
-    event_start = _coerce_timestamp(data.get("EventStartTime", now))
-    event_end = _coerce_timestamp(data.get("EventEndTime", now))
+    event_start = _coerce_timestamp(data["EventStartTime"])
+    event_end = _coerce_timestamp(data["EventEndTime"])
+    if (
+        isinstance(event_start, (int, float))
+        and isinstance(event_end, (int, float))
+        and event_end <= event_start
+    ):
+        return error_response_json(
+            "ValidationException",
+            "Parameter EventEndTime is not valid. Reason: EventEndTime must be after EventStartTime.",
+            400,
+        )
+    # AWS: "you can specify for EventBridge to send the events to specific
+    # rules" — an empty/missing FilterArns list means all rules on the bus.
+    filter_arns = dest.get("FilterArns") or []
+    only_rule_arns = set(filter_arns) if filter_arns else None
     replay = {
         "ReplayName": name,
         "ReplayArn": arn,
@@ -3242,7 +3361,9 @@ def _start_replay(data):
         set_request_region(replay_region)
         try:
             replay["State"] = "RUNNING"
-            for event in list(archive.get("Events", [])):
+            # Real replays process events in event-time order (1-minute
+            # intervals); mirror the ordering, not the pacing.
+            for event in sorted(archive.get("Events", []), key=lambda e: e.get("Time", 0)):
                 ts = event.get("Time", 0)
                 if not (event_start <= ts <= event_end):
                     continue
@@ -3250,9 +3371,12 @@ def _start_replay(data):
                 replayed["EventBusName"] = dest_bus_name
                 # AWS stamps a replayed event with the replay's name, which is
                 # how a rule tells replayed traffic from live traffic — either
-                # to act on it or, more often, to filter it out.
+                # to act on it or, more often, to filter it out. Consumed by
+                # the delivered envelope and by _archive_event (a replayed
+                # event is never re-archived).
                 replayed["ReplayName"] = name
-                _dispatch_event(replayed)
+                _dispatch_event(replayed, only_rule_arns=only_rule_arns)
+                replay["EventLastReplayedTime"] = ts
             replay["State"] = "COMPLETED"
             replay["ReplayEndTime"] = _now_ts()
         finally:
@@ -3264,7 +3388,7 @@ def _start_replay(data):
 
     # Real AWS StartReplay returns the initial state STARTING; the
     # replay flips to RUNNING in the background dispatch thread above.
-    return json_response({"ReplayArn": arn, "State": "STARTING"})
+    return json_response({"ReplayArn": arn, "State": "STARTING", "ReplayStartTime": now})
 
 
 def _describe_replay(data):
@@ -3307,14 +3431,15 @@ def _cancel_replay(data):
     rep = _replays.get(name)
     if not rep:
         return error_response_json("ResourceNotFoundException", f"Replay {name} does not exist.", 400)
-    if rep["State"] == "COMPLETED":
+    if rep["State"] not in ("STARTING", "RUNNING"):
+        # AWS: "a replay can be canceled only when the state is Running or
+        # Starting" — anything else draws IllegalStatusException.
         return error_response_json(
-            "ValidationException",
-            "Replay is already completed",
+            "IllegalStatusException",
+            f"Replay {name} is already in state {rep['State']} and can only be canceled "
+            "when the state is Running or Starting.",
             400,
         )
-    if rep["State"] == "CANCELLED":
-        return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
     rep["State"] = "CANCELLED"
     rep["ReplayEndTime"] = _now_ts()
     return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
