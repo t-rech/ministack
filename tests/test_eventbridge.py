@@ -2036,6 +2036,133 @@ def test_eventbridge_create_archive_validations(eb):
     assert exc.value.response["Error"]["Code"] == "InvalidEventPatternException"
 
 
+def test_eventbridge_list_archives_pagination(eb):
+    """ListArchives honors Limit + NextToken (page through 5 archives, 2 at a
+    time) and returns the documented response shape."""
+    prefix = f"pag-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    expected = {f"{prefix}-{i}" for i in range(5)}
+    for name in expected:
+        eb.create_archive(ArchiveName=name, EventSourceArn=bus_arn)
+    try:
+        seen = set()
+        pages = 0
+        token = None
+        while True:
+            kwargs = {"NamePrefix": prefix, "Limit": 2}
+            if token:
+                kwargs["NextToken"] = token
+            resp = eb.list_archives(**kwargs)
+            pages += 1
+            for archive in resp["Archives"]:
+                assert archive["State"] == "ENABLED"
+                assert archive["EventSourceArn"] == bus_arn
+                seen.add(archive["ArchiveName"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        assert seen == expected
+        assert pages == 3
+    finally:
+        for name in expected:
+            eb.delete_archive(ArchiveName=name)
+
+
+def test_eventbridge_list_replays_pagination_and_shape(eb):
+    """ListReplays honors Limit + NextToken and returns the documented Replay
+    list members (EventStartTime/EventEndTime/ReplayStartTime/State)."""
+    arch_name = f"pag-rep-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    prefix = f"pag-rep-{_uuid_mod.uuid4().hex[:8]}"
+    expected = {f"{prefix}-{i}" for i in range(5)}
+    try:
+        for name in expected:
+            eb.start_replay(
+                ReplayName=name,
+                EventSourceArn=archive_arn,
+                EventStartTime=0,
+                EventEndTime=time.time() + 3600,
+                Destination={"Arn": bus_arn},
+            )
+        seen = set()
+        pages = 0
+        token = None
+        while True:
+            kwargs = {"NamePrefix": prefix, "Limit": 2}
+            if token:
+                kwargs["NextToken"] = token
+            resp = eb.list_replays(**kwargs)
+            pages += 1
+            for rep in resp["Replays"]:
+                assert "EventStartTime" in rep
+                assert "EventEndTime" in rep
+                assert "ReplayStartTime" in rep
+                assert rep["State"] in ("STARTING", "RUNNING", "COMPLETED")
+                seen.add(rep["ReplayName"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        assert seen == expected
+        assert pages == 3
+    finally:
+        eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_cancel_replay_cancelled_is_terminal(eb, sqs):
+    """A cancel that lands while the replay is dispatching must stick — the
+    dispatch thread previously finished by stamping COMPLETED unconditionally,
+    overwriting CANCELLED (an illegal state transition)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-cxl-bus-{suffix}"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus}"
+    arch_name = f"cxl-arch-{suffix}"
+    source = f"cxl.{suffix}"
+    eb.create_event_bus(Name=bus)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    # A rule with a real target makes each replayed event do dispatch work,
+    # widening the window in which the cancel can land mid-replay.
+    q_url = sqs.create_queue(QueueName=f"qa-eb-cxl-q-{suffix}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=f"qa-eb-cxl-rule-{suffix}", EventBusName=bus,
+        EventPattern=json.dumps({"source": [source]}), State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=f"qa-eb-cxl-rule-{suffix}", EventBusName=bus,
+        Targets=[{"Id": "q", "Arn": q_arn}],
+    )
+    for _ in range(20):
+        eb.put_events(Entries=[
+            {"Source": source, "DetailType": "Bulk", "Detail": "{}", "EventBusName": bus}
+            for _ in range(10)
+        ])
+    assert eb.describe_archive(ArchiveName=arch_name)["EventCount"] == 200
+
+    rep_name = f"cxl-rep-{suffix}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    try:
+        cancelled = eb.cancel_replay(ReplayName=rep_name)["State"] == "CANCELLED"
+    except ClientError as e:
+        # The replay finished before the cancel arrived.
+        assert e.response["Error"]["Code"] == "IllegalStatusException"
+        cancelled = False
+    # Let the dispatch thread run to its end, then check it did not stomp
+    # the state either way.
+    time.sleep(0.5)
+    final = eb.describe_replay(ReplayName=rep_name)["State"]
+    assert final == ("CANCELLED" if cancelled else "COMPLETED")
+    eb.delete_archive(ArchiveName=arch_name)
+
+
 def test_eventbridge_archive_event_count_accumulation(eb):
     """EventCount increments once per matching PutEvents call."""
     arch_name = f"accum-arch-{_uuid_mod.uuid4().hex[:8]}"

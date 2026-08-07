@@ -202,6 +202,7 @@ def restore_state(data):
             # Same precedent as Step Functions executions (stepfunctions.py).
             if rep.get("State") in ("STARTING", "RUNNING"):
                 rep["State"] = "FAILED"
+                rep["StateReason"] = "Replay was interrupted before completion and cannot be resumed."
                 rep["ReplayEndTime"] = _now_ts()
 
 
@@ -3252,6 +3253,17 @@ def _list_archives(data):
     prefix = data.get("NamePrefix", "")
     source_arn = data.get("EventSourceArn", "")
     state = data.get("State", "")
+    # AWS spec: ListArchives supports NextToken + Limit (1..100, default 100).
+    limit = int(data.get("Limit", 100))
+    if limit < 1 or limit > 100:
+        limit = 100
+    # Explicit response shape (ListArchives API reference) — the stored record
+    # also carries the captured events (replay's source of truth), which must
+    # never be serialized onto the wire.
+    fields = (
+        "ArchiveName", "EventSourceArn", "State", "StateReason",
+        "RetentionDays", "SizeBytes", "EventCount", "CreationTime",
+    )
     results = []
     for name, archive in _archives.items():
         if prefix and not name.startswith(prefix):
@@ -3260,8 +3272,14 @@ def _list_archives(data):
             continue
         if state and archive.get("State") != state:
             continue
-        results.append(archive)
-    return json_response({"Archives": results})
+        results.append({k: archive[k] for k in fields if k in archive})
+    results.sort(key=lambda a: a["ArchiveName"])
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    page = results[start:start + limit]
+    resp = {"Archives": page}
+    if start + limit < len(results):
+        resp["NextToken"] = _opaque_offset_encode(start + limit)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -3360,10 +3378,16 @@ def _start_replay(data):
         set_request_account_id(replay_account_id)
         set_request_region(replay_region)
         try:
+            # CANCELLED is terminal: CancelReplay may win the race at any
+            # point, and this thread must never overwrite it.
+            if replay.get("State") != "STARTING":
+                return
             replay["State"] = "RUNNING"
             # Real replays process events in event-time order (1-minute
             # intervals); mirror the ordering, not the pacing.
             for event in sorted(archive.get("Events", []), key=lambda e: e.get("Time", 0)):
+                if replay.get("State") == "CANCELLED":
+                    return
                 ts = event.get("Time", 0)
                 if not (event_start <= ts <= event_end):
                     continue
@@ -3377,8 +3401,9 @@ def _start_replay(data):
                 replayed["ReplayName"] = name
                 _dispatch_event(replayed, only_rule_arns=only_rule_arns)
                 replay["EventLastReplayedTime"] = ts
-            replay["State"] = "COMPLETED"
-            replay["ReplayEndTime"] = _now_ts()
+            if replay.get("State") == "RUNNING":
+                replay["State"] = "COMPLETED"
+                replay["ReplayEndTime"] = _now_ts()
         finally:
             set_request_account_id(previous_account)
             set_request_region(previous_region)
@@ -3405,6 +3430,17 @@ def _list_replays(data):
     prefix = data.get("NamePrefix", "")
     state_f = data.get("State", "")
     source_f = data.get("EventSourceArn", "")
+    # AWS spec: ListReplays supports NextToken + Limit (1..100, default 100).
+    limit = int(data.get("Limit", 100))
+    if limit < 1 or limit > 100:
+        limit = 100
+    # The documented Replay list shape (ListReplays API reference) — notably
+    # it does NOT carry ReplayArn.
+    fields = (
+        "ReplayName", "EventSourceArn", "State", "StateReason",
+        "EventStartTime", "EventEndTime", "EventLastReplayedTime",
+        "ReplayStartTime", "ReplayEndTime",
+    )
     results = []
     for n in sorted(_replays.keys()):
         rep = _replays[n]
@@ -3414,14 +3450,13 @@ def _list_replays(data):
             continue
         if source_f and rep.get("EventSourceArn") != source_f:
             continue
-        results.append({
-            "ReplayName": rep["ReplayName"],
-            "ReplayArn": rep["ReplayArn"],
-            "State": rep["State"],
-            "EventSourceArn": rep.get("EventSourceArn", ""),
-            "ReplayStartTime": rep.get("ReplayStartTime", ""),
-        })
-    return json_response({"Replays": results})
+        results.append({k: rep[k] for k in fields if k in rep})
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    page = results[start:start + limit]
+    resp = {"Replays": page}
+    if start + limit < len(results):
+        resp["NextToken"] = _opaque_offset_encode(start + limit)
+    return json_response(resp)
 
 
 def _cancel_replay(data):
