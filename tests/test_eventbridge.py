@@ -3191,13 +3191,13 @@ def _start_oauth_issuer(tokens=("tok-1",), expires_in=3600):
     remaining = list(tokens)
 
     class _Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(length).decode("utf-8") if length else ""
+        def _issue(self, form, query):
             token_requests.append({
-                "path": self.path,
+                "path": self.path.partition("?")[0],
+                "method": self.command,
                 "headers": {k.lower(): v for k, v in self.headers.items()},
-                "form": {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()},
+                "form": form,
+                "query": query,
             })
             token = remaining.pop(0) if len(remaining) > 1 else remaining[0]
             payload = json.dumps(
@@ -3208,6 +3208,15 @@ def _start_oauth_issuer(tokens=("tok-1",), expires_in=3600):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            self._issue({k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()}, {})
+
+        def do_GET(self):
+            qs = self.path.partition("?")[2]
+            self._issue({}, {k: v[0] for k, v in parse_qs(qs, keep_blank_values=True).items()})
 
         def log_message(self, _format, *_args):
             return
@@ -5661,6 +5670,204 @@ def test_eventbridge_case_insensitive_suffix_does_not_scan_quadratically():
     assert _eb._matches_content_filter(
         value, {"suffix": {"equals-ignore-case": ".PNG"}}) is True
     assert time.monotonic() - started < 1.0
+def test_eventbridge_api_destination_oauth_refresh_on_407(eb):
+    """407 is in the same refresh class as 401: token refresh, one retry."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-old", "tok-new"))
+    server, captured = _start_api_dest_capture_server(status_plan=[407, 200])
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth407",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "POST",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                }
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-old"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-new"
+        assert len(token_requests) == 2
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_proactive_refresh_near_expiry(eb):
+    """A cached token expiring within 60s of an invocation is refreshed
+    proactively, on the event path — expires_in=30 keeps the cache permanently
+    near-expiry, so every delivery performs a fresh token exchange."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-a", "tok-b"), expires_in=30)
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth-exp",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "POST",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                }
+            },
+        )
+        entry = {
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+
+        assert len(token_requests) == 2
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-a"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-b"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_get_token_request(eb):
+    """OAuthParameters.HttpMethod=GET sends the token request as GET with the
+    OAuthHttpParameters in the query string and no form body — still
+    authenticated with HTTP Basic (ClientID:ClientSecret)."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-g",))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth-get",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "GET",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                    "OAuthHttpParameters": {
+                        "BodyParameters": [
+                            {"Key": "grant_type", "Value": "client_credentials"},
+                            {"Key": "audience", "Value": "https://api.example.test"},
+                        ]
+                    },
+                }
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(token_requests) == 1
+        token_req = token_requests[0]
+        assert token_req["method"] == "GET"
+        assert token_req["path"] == "/oauth/token"
+        assert token_req["form"] == {}
+        assert token_req["query"] == {
+            "grant_type": "client_credentials",
+            "audience": "https://api.example.test",
+        }
+        expected_basic = "Basic " + base64.b64encode(b"cid:csec").decode("ascii")
+        assert token_req["headers"]["authorization"] == expected_basic
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-g"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_custom_http_method(eb):
+    """The destination's configured HttpMethod drives the delivery request."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "putmethod",
+            f"http://127.0.0.1:{port}/upsert",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-put"}},
+            http_method="PUT",
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert captured[0]["method"] == "PUT"
+        assert captured[0]["headers"]["x-api-key"] == "k-put"
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_strips_removed_headers(eb):
+    """Connection header parameters cannot smuggle the headers real EventBridge
+    removes (Host, Referer, Date, …); ordinary custom headers still pass."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "hdrstrip",
+            f"http://127.0.0.1:{port}/hook",
+            "API_KEY",
+            {
+                "ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-h"},
+                "InvocationHttpParameters": {
+                    "HeaderParameters": [
+                        {"Key": "Host", "Value": "evil.example.test"},
+                        {"Key": "Referer", "Value": "http://smuggle.example.test"},
+                        {"Key": "Date", "Value": "Mon, 01 Jan 2001 00:00:00 GMT"},
+                        {"Key": "X-Ok", "Value": "yes"},
+                    ]
+                },
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        req = captured[0]
+        # The transport sets its own Host; the smuggled value must not win.
+        assert req["headers"]["host"].startswith("127.0.0.1")
+        assert "referer" not in req["headers"]
+        assert "date" not in req["headers"]
+        assert req["headers"]["x-ok"] == "yes"
+    finally:
+        server.shutdown()
+
+
 def test_eventbridge_api_destination_failed_delivery_lands_in_dlq(eb, sqs):
     """A failed delivery dead-letters the ORIGINAL event with the AWS message attributes."""
     server, captured = _start_api_dest_capture_server(status_plan=[500])
@@ -5711,6 +5918,136 @@ def test_eventbridge_api_destination_failed_delivery_lands_in_dlq(eb, sqs):
         assert attrs["TARGET_ARN"]["StringValue"].startswith("arn:aws:events:")
         assert ":api-destination/" in attrs["TARGET_ARN"]["StringValue"]
         assert "ERROR_MESSAGE" in attrs
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_connection_failure_dead_letters(eb, sqs):
+    """An unreachable endpoint dead-letters as CONNECTION_FAILURE with the
+    exhausted-retry condition (the network-error class of eb-rule-dlq)."""
+    import socket
+
+    # Grab a port that nothing is listening on so the connect is refused.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+
+    q_url = sqs.create_queue(QueueName="qa-eb-connfail-dlq-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    bus_name, source = _api_dest_pipeline(
+        eb,
+        "connfail",
+        f"http://127.0.0.1:{dead_port}/unreachable",
+        "API_KEY",
+        {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+        target_extras={"DeadLetterConfig": {"Arn": q_arn}},
+    )
+    eb.put_events(Entries=[{
+        "Source": source,
+        "DetailType": "Ping",
+        "Detail": json.dumps({"n": 1}),
+        "EventBusName": bus_name,
+    }])
+
+    messages = []
+
+    def _drain():
+        resp = sqs.receive_message(
+            QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+        )
+        messages.extend(resp.get("Messages", []))
+        return len(messages) >= 1
+
+    assert _wait_until(_drain)
+    attrs = messages[0]["MessageAttributes"]
+    assert attrs["ERROR_CODE"]["StringValue"] == "CONNECTION_FAILURE"
+    assert attrs["EXHAUSTED_RETRY_CONDITION"]["StringValue"] == "MaximumRetryAttempts"
+    assert json.loads(messages[0]["Body"])["source"] == source
+
+
+def test_eventbridge_api_destination_non_retryable_4xx_dead_letters_without_retry(eb, sqs):
+    """A 404 is outside the documented retryable class (401/407/409/429/5xx):
+    exactly one request is made and the event dead-letters WITHOUT the
+    exhausted-retry condition."""
+    server, captured = _start_api_dest_capture_server(status_plan=[404])
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-nonretry-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "nonretry",
+            f"http://127.0.0.1:{port}/missing",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+            target_extras={"DeadLetterConfig": {"Arn": q_arn}},
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        # Delivery finished (the DLQ message proves it) — and made ONE attempt.
+        assert len(captured) == 1
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "ERROR_FROM_TARGET"
+        assert attrs["ERROR_MESSAGE"]["StringValue"] == "HTTP 404"
+        assert "EXHAUSTED_RETRY_CONDITION" not in attrs
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_deleted_destination_dead_letters_no_resource(eb, sqs):
+    """A target whose API destination no longer exists dead-letters as
+    NO_RESOURCE without any HTTP request being made."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-deldest-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "deldest",
+            f"http://127.0.0.1:{port}/hook",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+            target_extras={"DeadLetterConfig": {"Arn": q_arn}},
+        )
+        eb.delete_api_destination(Name="qa-eb-apidest-deldest-dest")
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "NO_RESOURCE"
+        assert "EXHAUSTED_RETRY_CONDITION" not in attrs
+        assert len(captured) == 0
     finally:
         server.shutdown()
 
