@@ -3622,7 +3622,11 @@ def test_eventbridge_api_destination_oauth_token_dies_with_the_connection(eb):
         eb.put_events(Entries=[entry])
         assert _wait_until(lambda: len(captured) >= 2)
         assert len(token_requests) == 2
-        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        # OAuth token requests authenticate with HTTP Basic (ClientID:ClientSecret),
+        # so the rotated secret rides the Authorization header, not the form body.
+        assert token_requests[1]["headers"]["authorization"] == (
+            "Basic " + base64.b64encode(b"cid:rotated").decode("ascii")
+        )
         assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
     finally:
         issuer.shutdown()
@@ -3658,7 +3662,11 @@ def test_eventbridge_api_destination_oauth_token_evicted_on_reauthorization(eb):
         eb.put_events(Entries=[entry])
         assert _wait_until(lambda: len(captured) >= 2)
         assert len(token_requests) == 2
-        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        # OAuth token requests authenticate with HTTP Basic (ClientID:ClientSecret),
+        # so the rotated secret rides the Authorization header, not the form body.
+        assert token_requests[1]["headers"]["authorization"] == (
+            "Basic " + base64.b64encode(b"cid:rotated").decode("ascii")
+        )
         assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
     finally:
         issuer.shutdown()
