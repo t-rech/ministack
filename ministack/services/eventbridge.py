@@ -158,6 +158,9 @@ def get_state():
         "event_bus_policies": copy.deepcopy(_event_bus_policies),
         "connections": copy.deepcopy(_connections),
         "api_destinations": copy.deepcopy(_api_destinations),
+        # _oauth_tokens is deliberately NOT persisted: it is a cache, and a
+        # restored process re-fetches tokens from the connection's
+        # authorization endpoint on the next delivery.
     }
 
 
@@ -189,7 +192,8 @@ def restore_state(data):
                 rule["CreationTime"] = _coerce_timestamp(rule["CreationTime"])
 
         for rep in _replays.all_values():
-            for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime"):
+            for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime",
+                       "EventLastReplayedTime"):
                 if tk in rep and rep[tk] is not None:
                     rep[tk] = _coerce_timestamp(rep[tk])
             # Replays whose dispatch thread was running at shutdown can't
@@ -198,6 +202,7 @@ def restore_state(data):
             # Same precedent as Step Functions executions (stepfunctions.py).
             if rep.get("State") in ("STARTING", "RUNNING"):
                 rep["State"] = "FAILED"
+                rep["StateReason"] = "Replay was interrupted before completion and cannot be resumed."
                 rep["ReplayEndTime"] = _now_ts()
 
 
@@ -667,6 +672,20 @@ def _put_targets(data):
         error = _validate_target_arn(target)
         if error:
             return error
+        error = _validate_target_dead_letter_config(target)
+        if error:
+            return error
+        if "Input" in target:
+            # AWS validates static Input at PutTargets time — it must be valid
+            # JSON text, not at delivery.
+            try:
+                json.loads(target["Input"])
+            except (TypeError, ValueError):
+                return error_response_json(
+                    "ValidationException",
+                    f"Input for target {target.get('Id', '')} is not valid JSON.",
+                    400,
+                )
 
     if key not in _targets:
         _targets[key] = []
@@ -704,6 +723,29 @@ def _validate_target_arn(target):
     ):
         return error_response_json("ValidationException", "RoleArn is required", 400)
 
+    return None
+
+
+def _validate_target_dead_letter_config(target):
+    """AWS validates at PutTargets that DeadLetterConfig.Arn is an SQS queue
+    ARN; whether the queue exists (or is FIFO) only surfaces at delivery."""
+    arn = ((target.get("DeadLetterConfig") or {}).get("Arn") or "").strip()
+    if not arn:
+        return None
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {arn} is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+    if spec.service != "sqs":
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {arn} is not valid. Reason: DeadLetterConfig Arn must be an SQS queue Arn.",
+            400,
+        )
     return None
 
 
@@ -1030,6 +1072,10 @@ def _put_events(data):
 
 
 def _archive_event(event, view=None):
+    # AWS parity (CreateArchive API reference): "Replayed events are not sent
+    # to an archive" — the managed archive rule never matches them.
+    if event.get("ReplayName"):
+        return
     bus_name = event.get("EventBusName", "default")
     bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
     for archive in _archives.values():
@@ -1043,15 +1089,18 @@ def _archive_event(event, view=None):
                 continue
         archive.setdefault("Events", []).append(event)
         archive["EventCount"] = archive.get("EventCount", 0) + 1
+        archive["SizeBytes"] = archive.get("SizeBytes", 0) + len(json.dumps(event))
 
 
-def _dispatch_event(event, view=None):
+def _dispatch_event(event, view=None, only_rule_arns=None):
     bus_name = event.get("EventBusName", "default")
     event_path = set(event.get("_DispatchPath") or [])
     view = view or _pattern_event_view(event)
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
+            continue
+        if only_rule_arns is not None and rule.get("Arn") not in only_rule_arns:
             continue
         if key in event_path:
             logger.warning("EventBridge: recursive rule dispatch skipped for %s", key)
@@ -2233,10 +2282,16 @@ def _invoke_target(target, event, rule, view=None):
     view = view or _pattern_event_view(event)
     event_payload = json.dumps(view.event_with_detail())
 
+    # The pre-input-selection envelope. DLQ deliveries carry the ORIGINAL
+    # event, never the transformed target input.
+    envelope_payload = event_payload
+
     # An ``InputPath`` that does not resolve leaves the whole event in place.
     target_input_payload = None
+    transformer_input_invalid = False
     if target.get("InputTransformer"):
-        target_input_payload = _apply_input_transformer(target["InputTransformer"], rule, view)
+        target_input_payload, transformer_input_invalid = _apply_input_transformer(
+            target["InputTransformer"], rule, view)
     elif target.get("Input"):
         target_input_payload = target["Input"]
     elif target.get("InputPath"):
@@ -2251,7 +2306,9 @@ def _invoke_target(target, event, rule, view=None):
     if target_input_payload is not None:
         event_payload = target_input_payload
 
+    dlq = None
     try:
+        dlq = _resolve_target_dlq(target, rule, envelope_payload)
         try:
             spec = parse_arn(arn)
         except ArnParseError:
@@ -2259,11 +2316,13 @@ def _invoke_target(target, event, rule, view=None):
             return
 
         if spec.service == "events" and spec.resource.startswith("api-destination/"):
-            _dispatch_to_api_destination(spec, event_payload, target)
+            _dispatch_to_api_destination(
+                spec, event_payload, target, rule, dlq, transformer_input_invalid
+            )
         elif spec.service == "events":
-            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
+            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload, dlq)
         elif spec.service == "states":
-            _dispatch_to_stepfunctions(arn, event_payload)
+            _dispatch_to_stepfunctions(arn, event_payload, dlq)
         elif not _target_matches_request_scope(spec):
             # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
             # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
@@ -2276,15 +2335,19 @@ def _invoke_target(target, event, rule, view=None):
                 arn,
             )
         elif spec.service == "lambda":
-            _dispatch_to_lambda(arn, event_payload)
+            _dispatch_to_lambda(arn, event_payload, dlq)
         elif spec.service == "sqs":
-            _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+            _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {}, dlq)
         elif spec.service == "sns":
-            _dispatch_to_sns(arn, event_payload)
+            _dispatch_to_sns(arn, event_payload, dlq)
+        elif spec.service == "logs":
+            _dispatch_to_logs(spec, event_payload, dlq)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "INTERNAL_ERROR", str(e))
 
 
 def _target_matches_request_scope(spec) -> bool:
@@ -2292,7 +2355,7 @@ def _target_matches_request_scope(spec) -> bool:
     return spec.account_id == get_account_id() and spec.region == get_region()
 
 
-def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):
+def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None, dlq=None):
     if spec.service != "events" or not spec.resource.startswith("event-bus/"):
         logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
         return
@@ -2304,6 +2367,8 @@ def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=N
     bus_name = spec.resource.split("/", 1)[1]
     if bus_name not in _event_buses:
         logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"Event bus {bus_name} does not exist.")
         return
     source_rule_key = _rule_key(rule.get("Name"), rule.get("EventBusName", "default"))
     if source_rule_key in event_path:
@@ -2322,7 +2387,29 @@ def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=N
     logger.info("EventBridge -> Event bus %s: dispatched", spec)
 
 
+def _object_variable_positions_valid(template: str, object_vars) -> bool:
+    """AWS constrains input-transformer variables that resolve to a JSON object
+    or array to JSON VALUE positions — "you must place it as a key", i.e.
+    ``{"detail": <detail>}``. A bare or quoted placement is not a documented
+    form and the invocation fails with INVALID_JSON before any request is made
+    (verified live against API destinations). Valid here = every occurrence is
+    preceded, ignoring whitespace, by ``:``, ``[`` or ``,``."""
+    for var in object_vars:
+        placeholder = f"<{var}>"
+        start = template.find(placeholder)
+        while start != -1:
+            before = template[:start].rstrip()
+            if not before or before[-1] not in ":[,":
+                return False
+            start = template.find(placeholder, start + len(placeholder))
+    return True
+
+
 def _apply_input_transformer(transformer, rule, view):
+    """Render the target's InputTemplate. Returns ``(rendered, input_invalid)``
+    — ``input_invalid`` marks an object/array variable placed outside a JSON
+    value position, which real EventBridge rejects at invocation time (see
+    :func:`_object_variable_positions_valid`)."""
     input_paths = transformer.get("InputPathsMap", {})
     template = transformer.get("InputTemplate", "")
 
@@ -2332,6 +2419,7 @@ def _apply_input_transformer(transformer, rule, view):
     event_envelope = view.event_with_detail()
 
     replacements = {}
+    object_vars = set()
     for var_name, jpath in input_paths.items():
         parts = jpath.strip("$.").split(".")
         val = event_envelope
@@ -2339,6 +2427,8 @@ def _apply_input_transformer(transformer, rule, view):
             for p in parts:
                 if p:
                     val = val[p]
+            if isinstance(val, (dict, list)):
+                object_vars.add(var_name)
             replacements[var_name] = val if isinstance(val, str) else json.dumps(val)
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
@@ -2360,14 +2450,18 @@ def _apply_input_transformer(transformer, rule, view):
     # ingestion-time is reserved and uneditable, even if InputPathsMap declares it.
     replacements["aws.events.event.ingestion-time"] = ingestion_time
 
+    # The reserved envelope variables resolve to JSON objects and carry the
+    # same value-position constraint as InputPathsMap object variables.
+    object_vars.update({"aws.events.event.json", "aws.events.event"})
+
     result = template
     for var_name, val in replacements.items():
         result = result.replace(f"<{var_name}>", str(val))
 
-    return result
+    return result, not _object_variable_positions_valid(template, object_vars)
 
 
-def _dispatch_to_lambda(arn, payload):
+def _dispatch_to_lambda(arn, payload, dlq=None):
     from ministack.services import lambda_svc
 
     try:
@@ -2378,6 +2472,9 @@ def _dispatch_to_lambda(arn, payload):
     func, config, func_name = lambda_svc._get_func_record_for_ref(arn)
     if not func or not config:
         logger.warning("EventBridge → Lambda: function %s not found", func_name)
+        if dlq is not None:
+            # A missing target resource dead-letters without retry attempts.
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"Function not found: {arn}")
         return
     exec_record = lambda_svc._execution_record_for_config(func, config)
     threading.Thread(
@@ -2386,7 +2483,7 @@ def _dispatch_to_lambda(arn, payload):
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
 
 
-def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
+def _dispatch_to_sqs(spec, payload, sqs_parameters=None, dlq=None):
     """Dispatch an EventBridge event to an SQS queue.
 
     ``sqs_parameters`` carries the target's ``SqsParameters`` block from the
@@ -2402,6 +2499,8 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("EventBridge → SQS: queue %s not found", queue_name)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", "The specified queue does not exist.")
         return
 
     sqs_parameters = sqs_parameters or {}
@@ -2446,12 +2545,14 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     logger.info("EventBridge → SQS %s", queue_name)
 
 
-def _dispatch_to_sns(arn, payload):
+def _dispatch_to_sns(arn, payload, dlq=None):
     from ministack.services import sns as _sns
 
     topic = _sns._topics.get(arn)
     if not topic:
         logger.warning("EventBridge → SNS: topic %s not found", arn)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", "Topic does not exist")
         return
 
     msg_id = new_uuid()
@@ -2465,7 +2566,7 @@ def _dispatch_to_sns(arn, payload):
     logger.info("EventBridge → SNS %s", arn)
 
 
-def _dispatch_to_stepfunctions(arn, payload):
+def _dispatch_to_stepfunctions(arn, payload, dlq=None):
     from ministack.services import stepfunctions as _sfn
 
     # Accept all three SFN target ARN shapes EventBridge supports in real
@@ -2474,6 +2575,8 @@ def _dispatch_to_stepfunctions(arn, payload):
     # any state machine the caller's account can see.
     if _sfn._resolve_state_machine_arn(arn) is None:
         logger.warning("EventBridge → Step Functions: state machine %s not found", arn)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"State Machine Does Not Exist: '{arn}'")
         return
 
     sm_name = arn.rsplit(":", 1)[-1]
@@ -2608,22 +2711,21 @@ def _merge_body_parameters(payload: str, body_params: dict) -> str:
 
 def _fetch_oauth_token(oauth: dict) -> dict:
     """client_credentials exchange against the connection's authorization
-    endpoint: ClientID/ClientSecret ride the request body (query for GET),
-    OAuthHttpParameters contribute extra header/query/body parameters, and
-    ``access_token`` / ``token_type`` / ``expires_in`` are read from the JSON
-    response. ``grant_type`` defaults to ``client_credentials`` when
-    OAuthHttpParameters does not set one — AWS's own examples pass it
-    explicitly through body parameters."""
+    endpoint. Real EventBridge authenticates the token request with **HTTP
+    Basic auth** (``ClientID:ClientSecret``) and contributes nothing else —
+    ``grant_type``/``audience``/``scope`` reach the request only through the
+    connection's OAuthHttpParameters (header/query/body), exactly as
+    configured. ``access_token`` / ``token_type`` / ``expires_in`` are read
+    from the JSON response."""
+    import base64 as _b64
+
     method = (oauth.get("HttpMethod") or "POST").upper()
     client = oauth.get("ClientParameters") or {}
     http_params = oauth.get("OAuthHttpParameters") or {}
     headers = _connection_params_map(http_params.get("HeaderParameters"))
-    form = {
-        "grant_type": "client_credentials",
-        "client_id": client.get("ClientID", ""),
-        "client_secret": client.get("ClientSecret", ""),
-    }
-    form.update(_connection_params_map(http_params.get("BodyParameters")))
+    raw = f"{client.get('ClientID', '')}:{client.get('ClientSecret', '')}".encode("utf-8")
+    headers["Authorization"] = "Basic " + _b64.b64encode(raw).decode("ascii")
+    form = _connection_params_map(http_params.get("BodyParameters"))
     url = _merge_query(
         oauth.get("AuthorizationEndpoint", ""),
         _connection_params_map(http_params.get("QueryStringParameters")),
@@ -2631,7 +2733,7 @@ def _fetch_oauth_token(oauth: dict) -> dict:
     data = None
     if method == "GET":
         url = _merge_query(url, form)
-    else:
+    elif form:
         data = urllib.parse.urlencode(form).encode("utf-8")
         headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -2767,7 +2869,73 @@ def _api_destination_send_sync(request: dict, auth_headers: dict) -> int:
         return exc.code
 
 
-def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key):
+def _resolve_target_dlq(target, rule, envelope_payload):
+    """Resolve the target's DeadLetterConfig into a delivery context while the
+    request scope is still available (worker threads cannot read the
+    account/region-scoped stores). Returns None when no usable DLQ is
+    configured."""
+    arn = ((target.get("DeadLetterConfig") or {}).get("Arn") or "").strip()
+    if not arn:
+        return None
+    from ministack.services import sqs as _sqs
+
+    queue = _sqs._queue_by_arn(arn)
+    if queue is None:
+        logger.warning("EventBridge → DLQ: queue %s not found; failed deliveries will be dropped", arn)
+        return None
+    if queue.get("is_fifo"):
+        # AWS parity: EventBridge dead-letter queues must be standard queues.
+        logger.warning("EventBridge → DLQ: %s is a FIFO queue, which EventBridge does not support; ignored", arn)
+        return None
+    return {
+        "queue": queue,
+        "rule_arn": _rule_arn(rule.get("Name", ""), rule.get("EventBusName", "default")),
+        "target_arn": target.get("Arn", ""),
+        "event": envelope_payload,
+    }
+
+
+def _send_to_target_dlq(dlq, error_code: str, error_message: str, exhausted: str | None = None):
+    """Deliver one failed event to the target's dead-letter queue with the
+    message attributes real EventBridge stamps (RULE_ARN / TARGET_ARN /
+    ERROR_CODE / ERROR_MESSAGE / RETRY_ATTEMPTS, plus EXHAUSTED_RETRY_CONDITION
+    when the retry policy ran out). The body is the ORIGINAL event envelope.
+    Appends to the pre-resolved queue record — safe from the delivery worker
+    thread, the same cross-thread append the replay thread already performs."""
+    from ministack.services import sqs as _sqs
+
+    attrs = {
+        "RULE_ARN": {"DataType": "String", "StringValue": dlq["rule_arn"]},
+        "TARGET_ARN": {"DataType": "String", "StringValue": dlq["target_arn"]},
+        "ERROR_CODE": {"DataType": "String", "StringValue": error_code},
+        "ERROR_MESSAGE": {"DataType": "String", "StringValue": (error_message or "")[:1024]},
+        "RETRY_ATTEMPTS": {"DataType": "Number", "StringValue": "0"},
+    }
+    if exhausted:
+        attrs["EXHAUSTED_RETRY_CONDITION"] = {"DataType": "String", "StringValue": exhausted}
+    body = dlq["event"]
+    now = time.time()
+    msg = {
+        "id": new_uuid(),
+        "body": body,
+        "md5_body": hashlib.md5(body.encode()).hexdigest(),
+        "message_attributes": attrs,
+        "md5_attrs": _sqs._md5_msg_attrs(attrs),
+        "receipt_handle": None,
+        "sent_at": now,
+        "visible_at": now,
+        "receive_count": 0,
+        "attributes": {},
+        "sys": {"SenderId": "AROAEXAMPLE", "SentTimestamp": str(int(now * 1000))},
+    }
+    queue = dlq["queue"]
+    queue["messages"].append(msg)
+    if hasattr(_sqs, "_ensure_msg_fields"):
+        _sqs._ensure_msg_fields(queue["messages"][-1])
+    logger.info("EventBridge → DLQ: event sent (%s)", error_code)
+
+
+def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key, dlq=None):
     is_oauth = conn.get("AuthorizationType") == "OAUTH_CLIENT_CREDENTIALS"
     try:
         status = _api_destination_send_sync(request, _connection_auth_headers(conn, token_key))
@@ -2779,24 +2947,34 @@ def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key)
             )
     except Exception as exc:
         logger.warning("EventBridge → API destination %s delivery failed: %s", name, exc)
+        if dlq is not None:
+            code = "TIMEOUT" if isinstance(exc, TimeoutError) or "timed out" in str(exc) else "CONNECTION_FAILURE"
+            _send_to_target_dlq(dlq, code, str(exc), exhausted="MaximumRetryAttempts")
         return
     if 200 <= status < 300:
         logger.info("EventBridge → API destination %s: HTTP %s", name, status)
     elif status in (401, 407, 409, 429) or status >= 500:
         # AWS parity: these statuses re-enter the 24h/185-attempt retry pipeline
-        # (DLQ on exhaustion, Retry-After honored). MiniStack does not model
-        # that queue — the same policy as cross-region FailedInvocations — so
-        # the outcome is logged and the event dropped.
+        # (Retry-After honored). MiniStack does not model that queue — the same
+        # policy as cross-region FailedInvocations — so the delivery collapses
+        # to one attempt and, when a DLQ is configured, dead-letters immediately
+        # with the exhausted-retry condition it would eventually carry.
         logger.warning(
-            "EventBridge → API destination %s: retryable HTTP %s (retry pipeline not modeled; dropped)",
+            "EventBridge → API destination %s: retryable HTTP %s (retry pipeline not modeled)",
             name,
             status,
         )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "ERROR_FROM_TARGET", f"HTTP {status}", exhausted="MaximumRetryAttempts")
     else:
-        logger.warning("EventBridge → API destination %s: HTTP %s (not retryable; dropped)", name, status)
+        logger.warning("EventBridge → API destination %s: HTTP %s (not retryable)", name, status)
+        if dlq is not None:
+            # Real EventBridge sends non-retryable failures straight to the DLQ
+            # without retry attempts.
+            _send_to_target_dlq(dlq, "ERROR_FROM_TARGET", f"HTTP {status}")
 
 
-def _dispatch_to_api_destination(spec, payload, target):
+def _dispatch_to_api_destination(spec, payload, target, rule, dlq=None, input_invalid=False):
     if spec.account_id != get_account_id() or spec.region != get_region():
         logger.warning(
             "EventBridge → API destination: %s is outside the current account/region scope", spec
@@ -2807,15 +2985,31 @@ def _dispatch_to_api_destination(spec, payload, target):
     dest = _api_destinations.get(name)
     if not dest:
         logger.warning("EventBridge → API destination: %s not found", name)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"API destination {name} does not exist.")
+        return
+    if input_invalid:
+        # Live-verified AWS behavior: an InputTransformer placing an object
+        # variable outside a JSON value position fails the invocation BEFORE
+        # any HTTP request, dead-lettering as INVALID_JSON.
+        logger.warning(
+            "EventBridge → API destination %s: transformed input is not valid for the target "
+            "(object variable outside a JSON value position); not invoked",
+            name,
+        )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "INVALID_JSON", "Invalid input for target.")
         return
     if dest.get("ApiDestinationState") != "ACTIVE":
-        # Real EventBridge does not invoke INACTIVE destinations; the delivery
-        # fails into the retry pipeline instead. Log-and-drop, as above.
+        # Real EventBridge fails deliveries to a non-ACTIVE destination into
+        # the retry pipeline; with a DLQ configured they surface there.
         logger.warning(
             "EventBridge → API destination %s: state %s; not invoked",
             name,
             dest.get("ApiDestinationState"),
         )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"API destination {name} is not ACTIVE")
         return
     conn_name = (dest.get("ConnectionArn") or "").rsplit("/", 1)[-1]
     conn = _connections.get(conn_name) if conn_name else None
@@ -2823,6 +3017,8 @@ def _dispatch_to_api_destination(spec, payload, target):
         logger.warning(
             "EventBridge → API destination %s: connection %s not found", name, conn_name or "<unset>"
         )
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", f"Connection {conn_name or '<unset>'} not found")
         return
     if conn.get("ConnectionState") != "AUTHORIZED":
         # The mirror of the ApiDestinationState check above. DeauthorizeConnection
@@ -2844,9 +3040,38 @@ def _dispatch_to_api_destination(spec, payload, target):
     # the destination endpoint.
     threading.Thread(
         target=_deliver_to_api_destination,
-        args=(name, request, copy.deepcopy(conn), token_key),
+        args=(name, request, copy.deepcopy(conn), token_key, dlq),
         daemon=True,
     ).start()
+
+
+def _dispatch_to_logs(spec, payload, dlq=None):
+    """Deliver one matched event into a CloudWatch Logs log-group target. Real
+    EventBridge creates an opaque-named log stream and writes the (input-
+    selected) event as the log line; authorization via the logs resource
+    policy is not enforced here (MiniStack IAM is permissive)."""
+    from ministack.services import cloudwatch_logs as _logs
+
+    resource = spec.resource  # "log-group:<name>" or "log-group:<name>:*"
+    if not resource.startswith("log-group:"):
+        logger.warning("EventBridge → CloudWatch Logs: unsupported target ARN %s", spec)
+        return
+    group_name = resource[len("log-group:"):]
+    if group_name.endswith(":*"):
+        group_name = group_name[:-2]
+    if group_name not in _logs._log_groups:
+        logger.warning("EventBridge → CloudWatch Logs: log group %s not found", group_name)
+        if dlq is not None:
+            _send_to_target_dlq(dlq, "NO_RESOURCE", "The specified log group does not exist.")
+        return
+    stream_name = new_uuid()
+    _logs._create_log_stream({"logGroupName": group_name, "logStreamName": stream_name})
+    _logs._put_log_events({
+        "logGroupName": group_name,
+        "logStreamName": stream_name,
+        "logEvents": [{"timestamp": int(time.time() * 1000), "message": payload}],
+    })
+    logger.info("EventBridge → CloudWatch Logs %s: dispatched", group_name)
 
 
 # ---------------------------------------------------------------------------
@@ -2896,6 +3121,15 @@ def _create_archive(data):
     name = data.get("ArchiveName")
     if not name:
         return error_response_json("ValidationException", "ArchiveName is required", 400)
+    if len(name) > 48:
+        # AWS caps archive names at 48 chars (a 49-char name draws this
+        # ValidationException from the live API).
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'archiveName' failed to satisfy constraint: "
+            "Member must have length less than or equal to 48",
+            400,
+        )
     if name in _archives:
         return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists", 400)
 
@@ -2904,19 +3138,54 @@ def _create_archive(data):
         return _invalid_event_pattern(pattern_error)
 
     source_arn = data.get("EventSourceArn", "")
+    if not source_arn or not source_arn.startswith("arn:"):
+        return error_response_json(
+            "ValidationException",
+            "Parameter EventSourceArn is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+    bus_name, bus_error = _event_bus_name_from_ref(source_arn)
+    if bus_error:
+        code, message = bus_error
+        return error_response_json(code, message, 400)
+    if bus_name not in _event_buses:
+        return error_response_json(
+            "ResourceNotFoundException", f"Event bus {bus_name} does not exist.", 400
+        )
+
+    pattern = data.get("EventPattern", "")
+    if pattern:
+        try:
+            json.loads(pattern)
+        except (TypeError, json.JSONDecodeError):
+            return error_response_json(
+                "InvalidEventPatternException", "Event pattern is not valid JSON", 400
+            )
+
+    retention = int(data.get("RetentionDays") or 0)
+    if retention < 0:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{retention}' at 'retentionDays' failed to satisfy "
+            "constraint: Member must have value greater than or equal to 0",
+            400,
+        )
+
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:archive/{name}"
     _archives[name] = {
         "ArchiveName": name,
         "ArchiveArn": arn,
         "EventSourceArn": source_arn,
         "Description": data.get("Description", ""),
-        "EventPattern": data.get("EventPattern", ""),
-        "RetentionDays": data.get("RetentionDays", 0),
+        "EventPattern": pattern,
+        "RetentionDays": retention,
         "State": "ENABLED",
         "CreationTime": _now_ts(),
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    if "KmsKeyIdentifier" in data:
+        _archives[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({"ArchiveArn": arn, "State": "ENABLED", "CreationTime": _archives[name]["CreationTime"]})
 
 
@@ -2933,7 +3202,14 @@ def _describe_archive(data):
     archive = _archives.get(name)
     if not archive:
         return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
-    return json_response(archive)
+    # Explicit response shape: the stored record also carries the captured
+    # events (replay's source of truth), which the API never returns.
+    fields = (
+        "ArchiveArn", "ArchiveName", "EventSourceArn", "Description", "EventPattern",
+        "State", "StateReason", "RetentionDays", "SizeBytes", "EventCount",
+        "CreationTime", "LastUpdatedTime", "KmsKeyIdentifier",
+    )
+    return json_response({k: archive[k] for k in fields if k in archive})
 
 
 def _update_archive(data):
@@ -2953,7 +3229,17 @@ def _update_archive(data):
             return _invalid_event_pattern(pattern_error)
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
-        archive["RetentionDays"] = int(data["RetentionDays"])
+        retention = int(data["RetentionDays"] or 0)
+        if retention < 0:
+            return error_response_json(
+                "ValidationException",
+                f"1 validation error detected: Value '{retention}' at 'retentionDays' failed to satisfy "
+                "constraint: Member must have value greater than or equal to 0",
+                400,
+            )
+        archive["RetentionDays"] = retention
+    if "KmsKeyIdentifier" in data:
+        archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
 
     archive["LastUpdatedTime"] = _now_ts()
     return json_response({
@@ -2967,6 +3253,17 @@ def _list_archives(data):
     prefix = data.get("NamePrefix", "")
     source_arn = data.get("EventSourceArn", "")
     state = data.get("State", "")
+    # AWS spec: ListArchives supports NextToken + Limit (1..100, default 100).
+    limit = int(data.get("Limit", 100))
+    if limit < 1 or limit > 100:
+        limit = 100
+    # Explicit response shape (ListArchives API reference) — the stored record
+    # also carries the captured events (replay's source of truth), which must
+    # never be serialized onto the wire.
+    fields = (
+        "ArchiveName", "EventSourceArn", "State", "StateReason",
+        "RetentionDays", "SizeBytes", "EventCount", "CreationTime",
+    )
     results = []
     for name, archive in _archives.items():
         if prefix and not name.startswith(prefix):
@@ -2975,8 +3272,14 @@ def _list_archives(data):
             continue
         if state and archive.get("State") != state:
             continue
-        results.append(archive)
-    return json_response({"Archives": results})
+        results.append({k: archive[k] for k in fields if k in archive})
+    results.sort(key=lambda a: a["ArchiveName"])
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    page = results[start:start + limit]
+    resp = {"Archives": page}
+    if start + limit < len(results):
+        resp["NextToken"] = _opaque_offset_encode(start + limit)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -2987,6 +3290,14 @@ def _start_replay(data):
     name = data.get("ReplayName")
     if not name:
         return error_response_json("ValidationException", "ReplayName is required", 400)
+    if len(name) > 64:
+        # AWS caps replay names at 64 chars.
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'replayName' failed to satisfy constraint: "
+            "Member must have length less than or equal to 64",
+            400,
+        )
     if name in _replays:
         return error_response_json(
             "ResourceAlreadyExistsException",
@@ -3000,6 +3311,10 @@ def _start_replay(data):
             "Destination.Arn is required",
             400,
         )
+    # Both window bounds are required members on the live API.
+    for member in ("EventStartTime", "EventEndTime"):
+        if data.get(member) is None:
+            return error_response_json("ValidationException", f"{member} is required", 400)
 
     source_arn = data.get("EventSourceArn", "")
     archive_name, source_error = _archive_name_from_ref(source_arn)
@@ -3026,8 +3341,22 @@ def _start_replay(data):
 
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:replay/{name}"
     now = _now_ts()
-    event_start = _coerce_timestamp(data.get("EventStartTime", now))
-    event_end = _coerce_timestamp(data.get("EventEndTime", now))
+    event_start = _coerce_timestamp(data["EventStartTime"])
+    event_end = _coerce_timestamp(data["EventEndTime"])
+    if (
+        isinstance(event_start, (int, float))
+        and isinstance(event_end, (int, float))
+        and event_end <= event_start
+    ):
+        return error_response_json(
+            "ValidationException",
+            "Parameter EventEndTime is not valid. Reason: EventEndTime must be after EventStartTime.",
+            400,
+        )
+    # AWS: "you can specify for EventBridge to send the events to specific
+    # rules" — an empty/missing FilterArns list means all rules on the bus.
+    filter_arns = dest.get("FilterArns") or []
+    only_rule_arns = set(filter_arns) if filter_arns else None
     replay = {
         "ReplayName": name,
         "ReplayArn": arn,
@@ -3049,8 +3378,16 @@ def _start_replay(data):
         set_request_account_id(replay_account_id)
         set_request_region(replay_region)
         try:
+            # CANCELLED is terminal: CancelReplay may win the race at any
+            # point, and this thread must never overwrite it.
+            if replay.get("State") != "STARTING":
+                return
             replay["State"] = "RUNNING"
-            for event in list(archive.get("Events", [])):
+            # Real replays process events in event-time order (1-minute
+            # intervals); mirror the ordering, not the pacing.
+            for event in sorted(archive.get("Events", []), key=lambda e: e.get("Time", 0)):
+                if replay.get("State") == "CANCELLED":
+                    return
                 ts = event.get("Time", 0)
                 if not (event_start <= ts <= event_end):
                     continue
@@ -3058,11 +3395,15 @@ def _start_replay(data):
                 replayed["EventBusName"] = dest_bus_name
                 # AWS stamps a replayed event with the replay's name, which is
                 # how a rule tells replayed traffic from live traffic — either
-                # to act on it or, more often, to filter it out.
+                # to act on it or, more often, to filter it out. Consumed by
+                # the delivered envelope and by _archive_event (a replayed
+                # event is never re-archived).
                 replayed["ReplayName"] = name
-                _dispatch_event(replayed)
-            replay["State"] = "COMPLETED"
-            replay["ReplayEndTime"] = _now_ts()
+                _dispatch_event(replayed, only_rule_arns=only_rule_arns)
+                replay["EventLastReplayedTime"] = ts
+            if replay.get("State") == "RUNNING":
+                replay["State"] = "COMPLETED"
+                replay["ReplayEndTime"] = _now_ts()
         finally:
             set_request_account_id(previous_account)
             set_request_region(previous_region)
@@ -3072,7 +3413,7 @@ def _start_replay(data):
 
     # Real AWS StartReplay returns the initial state STARTING; the
     # replay flips to RUNNING in the background dispatch thread above.
-    return json_response({"ReplayArn": arn, "State": "STARTING"})
+    return json_response({"ReplayArn": arn, "State": "STARTING", "ReplayStartTime": now})
 
 
 def _describe_replay(data):
@@ -3089,6 +3430,17 @@ def _list_replays(data):
     prefix = data.get("NamePrefix", "")
     state_f = data.get("State", "")
     source_f = data.get("EventSourceArn", "")
+    # AWS spec: ListReplays supports NextToken + Limit (1..100, default 100).
+    limit = int(data.get("Limit", 100))
+    if limit < 1 or limit > 100:
+        limit = 100
+    # The documented Replay list shape (ListReplays API reference) — notably
+    # it does NOT carry ReplayArn.
+    fields = (
+        "ReplayName", "EventSourceArn", "State", "StateReason",
+        "EventStartTime", "EventEndTime", "EventLastReplayedTime",
+        "ReplayStartTime", "ReplayEndTime",
+    )
     results = []
     for n in sorted(_replays.keys()):
         rep = _replays[n]
@@ -3098,14 +3450,13 @@ def _list_replays(data):
             continue
         if source_f and rep.get("EventSourceArn") != source_f:
             continue
-        results.append({
-            "ReplayName": rep["ReplayName"],
-            "ReplayArn": rep["ReplayArn"],
-            "State": rep["State"],
-            "EventSourceArn": rep.get("EventSourceArn", ""),
-            "ReplayStartTime": rep.get("ReplayStartTime", ""),
-        })
-    return json_response({"Replays": results})
+        results.append({k: rep[k] for k in fields if k in rep})
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    page = results[start:start + limit]
+    resp = {"Replays": page}
+    if start + limit < len(results):
+        resp["NextToken"] = _opaque_offset_encode(start + limit)
+    return json_response(resp)
 
 
 def _cancel_replay(data):
@@ -3115,14 +3466,15 @@ def _cancel_replay(data):
     rep = _replays.get(name)
     if not rep:
         return error_response_json("ResourceNotFoundException", f"Replay {name} does not exist.", 400)
-    if rep["State"] == "COMPLETED":
+    if rep["State"] not in ("STARTING", "RUNNING"):
+        # AWS: "a replay can be canceled only when the state is Running or
+        # Starting" — anything else draws IllegalStatusException.
         return error_response_json(
-            "ValidationException",
-            "Replay is already completed",
+            "IllegalStatusException",
+            f"Replay {name} is already in state {rep['State']} and can only be canceled "
+            "when the state is Running or Starting.",
             400,
         )
-    if rep["State"] == "CANCELLED":
-        return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
     rep["State"] = "CANCELLED"
     rep["ReplayEndTime"] = _now_ts()
     return json_response({"ReplayArn": rep["ReplayArn"], "State": "CANCELLED"})
@@ -3464,12 +3816,125 @@ def _validate_oauth_authorization_endpoint(auth_params):
     if not isinstance(oauth, dict) or "AuthorizationEndpoint" not in oauth:
         return None
     return _validate_http_endpoint(oauth["AuthorizationEndpoint"], "AuthorizationEndpoint")
+def _upsert_connection_secret(conn_name: str, auth_parameters: dict, existing: dict | None = None) -> dict:
+    """Create (or refresh) the Secrets Manager secret backing a connection,
+    mirroring real EventBridge: the authorization parameters are stored in a
+    service-owned secret named ``events!connection/<name>/<uuid>`` whose ARN
+    surfaces as ``SecretArn`` on Create/Describe/Update responses."""
+    from ministack.services import secretsmanager as _sm
+
+    now = int(time.time())
+    value = json.dumps(auth_parameters or {})
+    if existing and existing.get("SecretName") in _sm._secrets:
+        record = _sm._secrets[existing["SecretName"]]
+        for version in record["Versions"].values():
+            version["Stages"] = [s for s in version["Stages"] if s != "AWSCURRENT"]
+        record["Versions"][new_uuid()] = {
+            "SecretString": value,
+            "SecretBinary": None,
+            "CreatedDate": now,
+            "Stages": ["AWSCURRENT"],
+        }
+        record["LastChangedDate"] = now
+        return {"SecretArn": record["ARN"], "SecretName": record["Name"]}
+
+    secret_name = f"events!connection/{conn_name}/{new_uuid()}"
+    arn = f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{secret_name}-{new_uuid()[:6]}"
+    _sm._secrets[secret_name] = {
+        "ARN": arn,
+        "Name": secret_name,
+        "Description": f"Auth parameters for EventBridge connection {conn_name}",
+        "Tags": [],
+        "CreatedDate": now,
+        "LastChangedDate": now,
+        "LastAccessedDate": None,
+        "DeletedDate": None,
+        "RotationEnabled": False,
+        "RotationLambdaARN": None,
+        "RotationRules": None,
+        "KmsKeyId": None,
+        "ReplicationStatus": [],
+        "Versions": {
+            new_uuid(): {
+                "SecretString": value,
+                "SecretBinary": None,
+                "CreatedDate": now,
+                "Stages": ["AWSCURRENT"],
+            }
+        },
+    }
+    return {"SecretArn": arn, "SecretName": secret_name}
+
+
+def _delete_connection_secret(conn: dict):
+    from ministack.services import secretsmanager as _sm
+
+    secret_name = conn.get("SecretName")
+    if secret_name:
+        _sm._secrets.pop(secret_name, None)
+
+
+def _sanitized_connection_http_parameters(params) -> dict:
+    """Response-shape parity for ConnectionHttpParameters: values flagged
+    ``IsValueSecret`` are never returned by Describe."""
+    out = {}
+    for field in ("HeaderParameters", "QueryStringParameters", "BodyParameters"):
+        items = (params or {}).get(field)
+        if not items:
+            continue
+        sanitized = []
+        for item in items:
+            entry = {"Key": item.get("Key", ""), "IsValueSecret": bool(item.get("IsValueSecret"))}
+            if not entry["IsValueSecret"]:
+                entry["Value"] = item.get("Value", "")
+            sanitized.append(entry)
+        out[field] = sanitized
+    return out
+
+
+def _sanitized_auth_parameters(conn: dict) -> dict:
+    """DescribeConnection response parity: AWS returns the
+    ConnectionAuthResponseParameters shape, which carries NO secret material —
+    only Username / ApiKeyName / ClientID survive, and http-parameter values
+    marked secret are stripped. The raw request-shape parameters stay on the
+    stored record for dispatch."""
+    params = conn.get("AuthParameters") or {}
+    out = {}
+    basic = params.get("BasicAuthParameters")
+    if basic:
+        out["BasicAuthParameters"] = {"Username": basic.get("Username", "")}
+    api_key = params.get("ApiKeyAuthParameters")
+    if api_key:
+        out["ApiKeyAuthParameters"] = {"ApiKeyName": api_key.get("ApiKeyName", "")}
+    oauth = params.get("OAuthParameters")
+    if oauth:
+        entry = {
+            "AuthorizationEndpoint": oauth.get("AuthorizationEndpoint", ""),
+            "HttpMethod": oauth.get("HttpMethod", ""),
+            "ClientParameters": {"ClientID": (oauth.get("ClientParameters") or {}).get("ClientID", "")},
+        }
+        if oauth.get("OAuthHttpParameters"):
+            entry["OAuthHttpParameters"] = _sanitized_connection_http_parameters(oauth["OAuthHttpParameters"])
+        out["OAuthParameters"] = entry
+    if params.get("InvocationHttpParameters"):
+        out["InvocationHttpParameters"] = _sanitized_connection_http_parameters(params["InvocationHttpParameters"])
+    return out
 
 
 def _create_connection(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    if len(name) > 64:
+        # AWS caps connection names at 64 chars and rejects at the API, not in
+        # the SDK — mirrored here so plan-time guards built on that behavior
+        # stay honest.
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: "
+            "Member must have length less than or equal to 64",
+            400,
+        )
     auth_type_error = _validate_enum(
         data.get("AuthorizationType"), _CONNECTION_AUTH_TYPES, "authorizationType")
     if auth_type_error:
@@ -3483,6 +3948,7 @@ def _create_connection(data):
 
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:connection/{name}"
     now = _now_ts()
+    secret = _upsert_connection_secret(name, data.get("AuthParameters", {}))
     _connections[name] = {
         "Name": name,
         "ConnectionArn": arn,
@@ -3490,10 +3956,14 @@ def _create_connection(data):
         "AuthorizationType": data.get("AuthorizationType", ""),
         "AuthParameters": data.get("AuthParameters", {}),
         "Description": data.get("Description", ""),
+        "SecretArn": secret["SecretArn"],
+        "SecretName": secret["SecretName"],
         "CreationTime": now,
         "LastModifiedTime": now,
         "LastAuthorizedTime": now,
     }
+    if "KmsKeyIdentifier" in data:
+        _connections[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({
         "ConnectionArn": arn,
         "ConnectionState": "AUTHORIZED",
@@ -3507,7 +3977,22 @@ def _describe_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
-    return json_response(conn)
+    out = {
+        "Name": conn["Name"],
+        "ConnectionArn": conn["ConnectionArn"],
+        "ConnectionState": conn["ConnectionState"],
+        "AuthorizationType": conn["AuthorizationType"],
+        "AuthParameters": _sanitized_auth_parameters(conn),
+        "Description": conn.get("Description", ""),
+        "CreationTime": conn["CreationTime"],
+        "LastModifiedTime": conn["LastModifiedTime"],
+        "LastAuthorizedTime": conn.get("LastAuthorizedTime", conn["CreationTime"]),
+    }
+    if conn.get("SecretArn"):
+        out["SecretArn"] = conn["SecretArn"]
+    if "KmsKeyIdentifier" in conn:
+        out["KmsKeyArn"] = conn["KmsKeyIdentifier"]
+    return json_response(out)
 
 
 def _delete_connection(data):
@@ -3517,6 +4002,7 @@ def _delete_connection(data):
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
     _evict_oauth_token(name)
+    _delete_connection_secret(conn)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": "DELETING",
@@ -3562,9 +4048,13 @@ def _update_connection(data):
             return endpoint_error
     conn = _connections[name]
     now = _now_ts()
-    for key in ("AuthorizationType", "AuthParameters", "Description"):
+    for key in ("AuthorizationType", "AuthParameters", "Description", "KmsKeyIdentifier"):
         if key in data:
             conn[key] = data[key]
+    if "AuthParameters" in data:
+        secret = _upsert_connection_secret(name, conn["AuthParameters"], existing=conn)
+        conn["SecretArn"] = secret["SecretArn"]
+        conn["SecretName"] = secret["SecretName"]
     if "AuthParameters" in data or "AuthorizationType" in data:
         # Re-authorization: the new credentials, not the cached token, decide
         # what the next invocation carries. A description-only update does not
@@ -3616,6 +4106,15 @@ def _create_api_destination(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    if len(name) > 64:
+        # AWS caps API destination names at 64 chars and rejects at the API,
+        # not in the SDK — mirrored for plan-time guards built on it.
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: "
+            "Member must have length less than or equal to 64",
+            400,
+        )
     endpoint_error = _validate_http_endpoint(data.get("InvocationEndpoint", ""), "InvocationEndpoint")
     if endpoint_error:
         return endpoint_error

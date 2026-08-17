@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -1190,6 +1191,7 @@ def test_eventbridge_replay_lifecycle(eb):
     # Real AWS returns STARTING as the immediate state; the background
     # dispatch flips through RUNNING to COMPLETED.
     assert start["State"] == "STARTING"
+    assert "ReplayStartTime" in start
     desc = eb.describe_replay(ReplayName=rep_name)
     assert desc["ReplayName"] == rep_name
     assert desc["State"] in ("STARTING", "RUNNING", "COMPLETED")
@@ -1202,8 +1204,9 @@ def test_eventbridge_replay_lifecycle(eb):
         desc2 = eb.describe_replay(ReplayName=rep_name)
         assert desc2["State"] == "CANCELLED"
     except _CE as e:
-        # Replay may have already completed before the cancel call
-        assert e.response["Error"]["Code"] == "ValidationException"
+        # Replay may have already completed before the cancel call; AWS
+        # rejects cancels outside Running/Starting with IllegalStatusException.
+        assert e.response["Error"]["Code"] == "IllegalStatusException"
         assert "completed" in e.response["Error"]["Message"].lower()
     eb.delete_archive(ArchiveName=arch)
 
@@ -1794,6 +1797,369 @@ def test_eventbridge_replay_rejects_plain_name_source(eb):
         )
 
     assert exc.value.response["Error"]["Code"] == "ValidationException"
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_missing_target_resource_dead_letters_no_resource(eb, sqs):
+    """A rule target whose resource does not exist dead-letters the event as
+    NO_RESOURCE with no retry attempts (eb-rule-dlq: 'a target resource that
+    no longer exists' goes straight to the DLQ), for any target type."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-dlq-any-bus-{suffix}"
+    rule = f"qa-eb-dlq-any-rule-{suffix}"
+    source = f"dlq.any.{suffix}"
+    eb.create_event_bus(Name=bus)
+    dlq_url = sqs.create_queue(QueueName=f"qa-eb-dlq-any-q-{suffix}")["QueueUrl"]
+    dlq_arn = sqs.get_queue_attributes(
+        QueueUrl=dlq_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    missing_queue_arn = f"arn:aws:sqs:us-east-1:000000000000:qa-eb-missing-q-{suffix}"
+    missing_func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:qa-eb-missing-fn-{suffix}"
+    eb.put_rule(
+        Name=rule, EventBusName=bus, EventPattern=json.dumps({"source": [source]}), State="ENABLED"
+    )
+    eb.put_targets(
+        Rule=rule,
+        EventBusName=bus,
+        Targets=[
+            {"Id": "missing-queue", "Arn": missing_queue_arn, "DeadLetterConfig": {"Arn": dlq_arn}},
+            {"Id": "missing-func", "Arn": missing_func_arn, "DeadLetterConfig": {"Arn": dlq_arn}},
+        ],
+    )
+    eb.put_events(Entries=[{
+        "Source": source, "DetailType": "Ping", "Detail": json.dumps({"n": 1}), "EventBusName": bus,
+    }])
+
+    messages = []
+
+    def _drain():
+        resp = sqs.receive_message(
+            QueueUrl=dlq_url, MaxNumberOfMessages=10, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+        )
+        messages.extend(resp.get("Messages", []))
+        return len(messages) >= 2
+
+    assert _wait_until(_drain)
+    target_arns = set()
+    for msg in messages:
+        attrs = msg["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "NO_RESOURCE"
+        # A missing resource dead-letters directly — no retries ran out.
+        assert "EXHAUSTED_RETRY_CONDITION" not in attrs
+        assert ":rule/" in attrs["RULE_ARN"]["StringValue"]
+        assert json.loads(msg["Body"])["source"] == source
+        target_arns.add(attrs["TARGET_ARN"]["StringValue"])
+    assert target_arns == {missing_queue_arn, missing_func_arn}
+
+
+def test_eventbridge_put_targets_rejects_non_sqs_dlq_arn(eb):
+    """DeadLetterConfig.Arn must be an SQS queue ARN — validated at PutTargets."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    rule = f"qa-eb-dlq-bad-arn-rule-{suffix}"
+    eb.put_rule(
+        Name=rule, EventPattern=json.dumps({"source": ["dlq.bad"]}), State="ENABLED"
+    )
+    with pytest.raises(ClientError) as exc:
+        eb.put_targets(
+            Rule=rule,
+            Targets=[{
+                "Id": "t1",
+                "Arn": f"arn:aws:sqs:us-east-1:000000000000:qa-eb-dlq-bad-target-{suffix}",
+                "DeadLetterConfig": {"Arn": "arn:aws:sns:us-east-1:000000000000:not-a-queue"},
+            }],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "SQS" in exc.value.response["Error"]["Message"]
+    eb.delete_rule(Name=rule)
+
+
+def test_eventbridge_replay_filter_arns_and_replay_name(eb, sqs):
+    """Destination.FilterArns limits which rules process replayed events, the
+    replayed envelope carries replay-name, replayed events are never
+    re-archived, and DescribeReplay reports EventLastReplayedTime."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-rf-bus-{suffix}"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus}"
+    arch_name = f"replay-filter-{suffix}"
+    source = f"replay.filter.{suffix}"
+    eb.create_event_bus(Name=bus)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+
+    queues = {}
+    rule_arns = {}
+    for idx in ("1", "2"):
+        q_url = sqs.create_queue(QueueName=f"qa-eb-rf-q{idx}-{suffix}")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(
+            QueueUrl=q_url, AttributeNames=["QueueArn"]
+        )["Attributes"]["QueueArn"]
+        rule = f"qa-eb-rf-rule{idx}-{suffix}"
+        rule_arns[idx] = eb.put_rule(
+            Name=rule, EventBusName=bus, EventPattern=json.dumps({"source": [source]}),
+            State="ENABLED",
+        )["RuleArn"]
+        eb.put_targets(Rule=rule, EventBusName=bus, Targets=[{"Id": f"q{idx}", "Arn": q_arn}])
+        queues[idx] = q_url
+
+    eb.put_events(Entries=[{
+        "Source": source, "DetailType": "Ping", "Detail": json.dumps({"n": 1}), "EventBusName": bus,
+    }])
+
+    def _drain_one(q_url, box):
+        def _inner():
+            resp = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+            box.extend(resp.get("Messages", []))
+            return len(box) >= 1
+        return _inner
+
+    live1, live2 = [], []
+    assert _wait_until(_drain_one(queues["1"], live1))
+    assert _wait_until(_drain_one(queues["2"], live2))
+    assert "replay-name" not in json.loads(live1[0]["Body"])
+    desc = eb.describe_archive(ArchiveName=arch_name)
+    assert desc["EventCount"] == 1
+    assert desc["SizeBytes"] > 0
+
+    rep_name = f"rep-filter-{suffix}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn, "FilterArns": [rule_arns["1"]]},
+    )
+    assert _wait_until(lambda: eb.describe_replay(ReplayName=rep_name)["State"] == "COMPLETED")
+
+    replayed1 = []
+    assert _wait_until(_drain_one(queues["1"], replayed1))
+    body = json.loads(replayed1[0]["Body"])
+    assert body["replay-name"] == rep_name
+    assert body["source"] == source
+    # Rule 2 is outside FilterArns — its queue must stay empty.
+    resp2 = sqs.receive_message(QueueUrl=queues["2"], MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert not resp2.get("Messages")
+    # Replayed events are not sent to an archive (CreateArchive API reference).
+    assert eb.describe_archive(ArchiveName=arch_name)["EventCount"] == 1
+    assert "EventLastReplayedTime" in eb.describe_replay(ReplayName=rep_name)
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_rule_replay_name_exists_false_skips_replays(eb, sqs):
+    """The documented anti-replay guard — "replay-name": [{"exists": false}]
+    in a rule pattern — matches live events but not replayed ones."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-noreplay-bus-{suffix}"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus}"
+    arch_name = f"noreplay-arch-{suffix}"
+    source = f"noreplay.{suffix}"
+    eb.create_event_bus(Name=bus)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    q_url = sqs.create_queue(QueueName=f"qa-eb-noreplay-q-{suffix}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+    rule = f"qa-eb-noreplay-rule-{suffix}"
+    eb.put_rule(
+        Name=rule,
+        EventBusName=bus,
+        EventPattern=json.dumps({"source": [source], "replay-name": [{"exists": False}]}),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule=rule, EventBusName=bus, Targets=[{"Id": "q", "Arn": q_arn}])
+
+    eb.put_events(Entries=[{
+        "Source": source, "DetailType": "Ping", "Detail": json.dumps({"n": 1}), "EventBusName": bus,
+    }])
+    live = []
+
+    def _drain():
+        resp = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+        live.extend(resp.get("Messages", []))
+        return len(live) >= 1
+
+    assert _wait_until(_drain)
+
+    rep_name = f"rep-noreplay-{suffix}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    assert _wait_until(lambda: eb.describe_replay(ReplayName=rep_name)["State"] == "COMPLETED")
+    resp = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+    assert not resp.get("Messages")
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_start_replay_rejects_inverted_window(eb):
+    """EventEndTime must be after EventStartTime."""
+    arch_name = f"replay-window-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    with pytest.raises(ClientError) as exc:
+        eb.start_replay(
+            ReplayName=f"rep-window-{_uuid_mod.uuid4().hex[:8]}",
+            EventSourceArn=archive_arn,
+            EventStartTime=1000,
+            EventEndTime=500,
+            Destination={"Arn": bus_arn},
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "EventEndTime" in exc.value.response["Error"]["Message"]
+    eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_create_archive_validations(eb):
+    """CreateArchive rejects a missing source bus and an invalid event
+    pattern the way real AWS does. (Negative RetentionDays is also rejected
+    server-side, but botocore already blocks it client-side.)"""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    default_bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+
+    with pytest.raises(ClientError) as exc:
+        eb.create_archive(
+            ArchiveName=f"qa-arch-nobus-{suffix}",
+            EventSourceArn=f"arn:aws:events:us-east-1:000000000000:event-bus/qa-missing-{suffix}",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        eb.create_archive(
+            ArchiveName=f"qa-arch-badpat-{suffix}",
+            EventSourceArn=default_bus_arn,
+            EventPattern="{not json",
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidEventPatternException"
+
+
+def test_eventbridge_list_archives_pagination(eb):
+    """ListArchives honors Limit + NextToken (page through 5 archives, 2 at a
+    time) and returns the documented response shape."""
+    prefix = f"pag-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    expected = {f"{prefix}-{i}" for i in range(5)}
+    for name in expected:
+        eb.create_archive(ArchiveName=name, EventSourceArn=bus_arn)
+    try:
+        seen = set()
+        pages = 0
+        token = None
+        while True:
+            kwargs = {"NamePrefix": prefix, "Limit": 2}
+            if token:
+                kwargs["NextToken"] = token
+            resp = eb.list_archives(**kwargs)
+            pages += 1
+            for archive in resp["Archives"]:
+                assert archive["State"] == "ENABLED"
+                assert archive["EventSourceArn"] == bus_arn
+                seen.add(archive["ArchiveName"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        assert seen == expected
+        assert pages == 3
+    finally:
+        for name in expected:
+            eb.delete_archive(ArchiveName=name)
+
+
+def test_eventbridge_list_replays_pagination_and_shape(eb):
+    """ListReplays honors Limit + NextToken and returns the documented Replay
+    list members (EventStartTime/EventEndTime/ReplayStartTime/State)."""
+    arch_name = f"pag-rep-arch-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    prefix = f"pag-rep-{_uuid_mod.uuid4().hex[:8]}"
+    expected = {f"{prefix}-{i}" for i in range(5)}
+    try:
+        for name in expected:
+            eb.start_replay(
+                ReplayName=name,
+                EventSourceArn=archive_arn,
+                EventStartTime=0,
+                EventEndTime=time.time() + 3600,
+                Destination={"Arn": bus_arn},
+            )
+        seen = set()
+        pages = 0
+        token = None
+        while True:
+            kwargs = {"NamePrefix": prefix, "Limit": 2}
+            if token:
+                kwargs["NextToken"] = token
+            resp = eb.list_replays(**kwargs)
+            pages += 1
+            for rep in resp["Replays"]:
+                assert "EventStartTime" in rep
+                assert "EventEndTime" in rep
+                assert "ReplayStartTime" in rep
+                assert rep["State"] in ("STARTING", "RUNNING", "COMPLETED")
+                seen.add(rep["ReplayName"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        assert seen == expected
+        assert pages == 3
+    finally:
+        eb.delete_archive(ArchiveName=arch_name)
+
+
+def test_eventbridge_cancel_replay_cancelled_is_terminal(eb, sqs):
+    """A cancel that lands while the replay is dispatching must stick — the
+    dispatch thread previously finished by stamping COMPLETED unconditionally,
+    overwriting CANCELLED (an illegal state transition)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bus = f"qa-eb-cxl-bus-{suffix}"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus}"
+    arch_name = f"cxl-arch-{suffix}"
+    source = f"cxl.{suffix}"
+    eb.create_event_bus(Name=bus)
+    eb.create_archive(ArchiveName=arch_name, EventSourceArn=bus_arn)
+    archive_arn = eb.describe_archive(ArchiveName=arch_name)["ArchiveArn"]
+    # A rule with a real target makes each replayed event do dispatch work,
+    # widening the window in which the cancel can land mid-replay.
+    q_url = sqs.create_queue(QueueName=f"qa-eb-cxl-q-{suffix}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=f"qa-eb-cxl-rule-{suffix}", EventBusName=bus,
+        EventPattern=json.dumps({"source": [source]}), State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=f"qa-eb-cxl-rule-{suffix}", EventBusName=bus,
+        Targets=[{"Id": "q", "Arn": q_arn}],
+    )
+    for _ in range(20):
+        eb.put_events(Entries=[
+            {"Source": source, "DetailType": "Bulk", "Detail": "{}", "EventBusName": bus}
+            for _ in range(10)
+        ])
+    assert eb.describe_archive(ArchiveName=arch_name)["EventCount"] == 200
+
+    rep_name = f"cxl-rep-{suffix}"
+    eb.start_replay(
+        ReplayName=rep_name,
+        EventSourceArn=archive_arn,
+        EventStartTime=0,
+        EventEndTime=time.time() + 3600,
+        Destination={"Arn": bus_arn},
+    )
+    try:
+        cancelled = eb.cancel_replay(ReplayName=rep_name)["State"] == "CANCELLED"
+    except ClientError as e:
+        # The replay finished before the cancel arrived.
+        assert e.response["Error"]["Code"] == "IllegalStatusException"
+        cancelled = False
+    # Let the dispatch thread run to its end, then check it did not stomp
+    # the state either way.
+    time.sleep(0.5)
+    final = eb.describe_replay(ReplayName=rep_name)["State"]
+    assert final == ("CANCELLED" if cancelled else "COMPLETED")
     eb.delete_archive(ArchiveName=arch_name)
 
 
@@ -2952,13 +3318,13 @@ def _start_oauth_issuer(tokens=("tok-1",), expires_in=3600):
     remaining = list(tokens)
 
     class _Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(length).decode("utf-8") if length else ""
+        def _issue(self, form, query):
             token_requests.append({
-                "path": self.path,
+                "path": self.path.partition("?")[0],
+                "method": self.command,
                 "headers": {k.lower(): v for k, v in self.headers.items()},
-                "form": {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()},
+                "form": form,
+                "query": query,
             })
             token = remaining.pop(0) if len(remaining) > 1 else remaining[0]
             payload = json.dumps(
@@ -2969,6 +3335,15 @@ def _start_oauth_issuer(tokens=("tok-1",), expires_in=3600):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            self._issue({k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()}, {})
+
+        def do_GET(self):
+            qs = self.path.partition("?")[2]
+            self._issue({}, {k: v[0] for k, v in parse_qs(qs, keep_blank_values=True).items()})
 
         def log_message(self, _format, *_args):
             return
@@ -3152,7 +3527,10 @@ def test_eventbridge_api_destination_oauth_client_credentials(eb):
                     "HttpMethod": "POST",
                     "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
                     "OAuthHttpParameters": {
-                        "BodyParameters": [{"Key": "audience", "Value": "https://api.example.test"}]
+                        "BodyParameters": [
+                            {"Key": "grant_type", "Value": "client_credentials"},
+                            {"Key": "audience", "Value": "https://api.example.test"},
+                        ]
                     },
                 }
             },
@@ -3172,11 +3550,15 @@ def test_eventbridge_api_destination_oauth_client_credentials(eb):
         assert len(token_requests) == 1
         token_req = token_requests[0]
         assert token_req["path"] == "/oauth/token"
+        # Real EventBridge authenticates the token request with HTTP Basic auth
+        # (ClientID:ClientSecret); the body carries only OAuthHttpParameters.
+        expected_basic = "Basic " + base64.b64encode(b"cid:csec").decode("ascii")
+        assert token_req["headers"]["authorization"] == expected_basic
         assert token_req["headers"]["content-type"] == "application/x-www-form-urlencoded"
-        assert token_req["form"]["grant_type"] == "client_credentials"
-        assert token_req["form"]["client_id"] == "cid"
-        assert token_req["form"]["client_secret"] == "csec"
-        assert token_req["form"]["audience"] == "https://api.example.test"
+        assert token_req["form"] == {
+            "grant_type": "client_credentials",
+            "audience": "https://api.example.test",
+        }
         assert captured[0]["headers"]["authorization"] == "Bearer tok-1"
         assert captured[1]["headers"]["authorization"] == "Bearer tok-1"
     finally:
@@ -3240,7 +3622,11 @@ def test_eventbridge_api_destination_oauth_token_dies_with_the_connection(eb):
         eb.put_events(Entries=[entry])
         assert _wait_until(lambda: len(captured) >= 2)
         assert len(token_requests) == 2
-        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        # OAuth token requests authenticate with HTTP Basic (ClientID:ClientSecret),
+        # so the rotated secret rides the Authorization header, not the form body.
+        assert token_requests[1]["headers"]["authorization"] == (
+            "Basic " + base64.b64encode(b"cid:rotated").decode("ascii")
+        )
         assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
     finally:
         issuer.shutdown()
@@ -3276,7 +3662,11 @@ def test_eventbridge_api_destination_oauth_token_evicted_on_reauthorization(eb):
         eb.put_events(Entries=[entry])
         assert _wait_until(lambda: len(captured) >= 2)
         assert len(token_requests) == 2
-        assert token_requests[1]["form"]["client_secret"] == "rotated"
+        # OAuth token requests authenticate with HTTP Basic (ClientID:ClientSecret),
+        # so the rotated secret rides the Authorization header, not the form body.
+        assert token_requests[1]["headers"]["authorization"] == (
+            "Basic " + base64.b64encode(b"cid:rotated").decode("ascii")
+        )
         assert captured[1]["headers"]["authorization"] == "Bearer tok-2"
     finally:
         issuer.shutdown()
@@ -5415,3 +5805,661 @@ def test_eventbridge_case_insensitive_suffix_does_not_scan_quadratically():
     assert _eb._matches_content_filter(
         value, {"suffix": {"equals-ignore-case": ".PNG"}}) is True
     assert time.monotonic() - started < 1.0
+def test_eventbridge_api_destination_oauth_refresh_on_407(eb):
+    """407 is in the same refresh class as 401: token refresh, one retry."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-old", "tok-new"))
+    server, captured = _start_api_dest_capture_server(status_plan=[407, 200])
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth407",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "POST",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                }
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 2)
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-old"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-new"
+        assert len(token_requests) == 2
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_proactive_refresh_near_expiry(eb):
+    """A cached token expiring within 60s of an invocation is refreshed
+    proactively, on the event path — expires_in=30 keeps the cache permanently
+    near-expiry, so every delivery performs a fresh token exchange."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-a", "tok-b"), expires_in=30)
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth-exp",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "POST",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                }
+            },
+        )
+        entry = {
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 1)
+        eb.put_events(Entries=[entry])
+        assert _wait_until(lambda: len(captured) >= 2)
+
+        assert len(token_requests) == 2
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-a"
+        assert captured[1]["headers"]["authorization"] == "Bearer tok-b"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_oauth_get_token_request(eb):
+    """OAuthParameters.HttpMethod=GET sends the token request as GET with the
+    OAuthHttpParameters in the query string and no form body — still
+    authenticated with HTTP Basic (ClientID:ClientSecret)."""
+    issuer, token_requests = _start_oauth_issuer(tokens=("tok-g",))
+    server, captured = _start_api_dest_capture_server()
+    try:
+        issuer_port = issuer.server_address[1]
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "oauth-get",
+            f"http://127.0.0.1:{port}/secured",
+            "OAUTH_CLIENT_CREDENTIALS",
+            {
+                "OAuthParameters": {
+                    "AuthorizationEndpoint": f"http://127.0.0.1:{issuer_port}/oauth/token",
+                    "HttpMethod": "GET",
+                    "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                    "OAuthHttpParameters": {
+                        "BodyParameters": [
+                            {"Key": "grant_type", "Value": "client_credentials"},
+                            {"Key": "audience", "Value": "https://api.example.test"},
+                        ]
+                    },
+                }
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(token_requests) == 1
+        token_req = token_requests[0]
+        assert token_req["method"] == "GET"
+        assert token_req["path"] == "/oauth/token"
+        assert token_req["form"] == {}
+        assert token_req["query"] == {
+            "grant_type": "client_credentials",
+            "audience": "https://api.example.test",
+        }
+        expected_basic = "Basic " + base64.b64encode(b"cid:csec").decode("ascii")
+        assert token_req["headers"]["authorization"] == expected_basic
+        assert captured[0]["headers"]["authorization"] == "Bearer tok-g"
+    finally:
+        issuer.shutdown()
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_custom_http_method(eb):
+    """The destination's configured HttpMethod drives the delivery request."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "putmethod",
+            f"http://127.0.0.1:{port}/upsert",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-put"}},
+            http_method="PUT",
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert captured[0]["method"] == "PUT"
+        assert captured[0]["headers"]["x-api-key"] == "k-put"
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_strips_removed_headers(eb):
+    """Connection header parameters cannot smuggle the headers real EventBridge
+    removes (Host, Referer, Date, …); ordinary custom headers still pass."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "hdrstrip",
+            f"http://127.0.0.1:{port}/hook",
+            "API_KEY",
+            {
+                "ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-h"},
+                "InvocationHttpParameters": {
+                    "HeaderParameters": [
+                        {"Key": "Host", "Value": "evil.example.test"},
+                        {"Key": "Referer", "Value": "http://smuggle.example.test"},
+                        {"Key": "Date", "Value": "Mon, 01 Jan 2001 00:00:00 GMT"},
+                        {"Key": "X-Ok", "Value": "yes"},
+                    ]
+                },
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        req = captured[0]
+        # The transport sets its own Host; the smuggled value must not win.
+        assert req["headers"]["host"].startswith("127.0.0.1")
+        assert "referer" not in req["headers"]
+        assert "date" not in req["headers"]
+        assert req["headers"]["x-ok"] == "yes"
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_failed_delivery_lands_in_dlq(eb, sqs):
+    """A failed delivery dead-letters the ORIGINAL event with the AWS message attributes."""
+    server, captured = _start_api_dest_capture_server(status_plan=[500])
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-apidest-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "dlq",
+            f"http://127.0.0.1:{port}/webhook",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+            target_extras={
+                "InputPath": "$.detail",
+                "DeadLetterConfig": {"Arn": q_arn},
+                "RetryPolicy": {"MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 3600},
+            },
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        assert _wait_until(lambda: len(captured) >= 1)
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        msg = messages[0]
+        # The DLQ body is the ORIGINAL envelope, not the InputPath-selected input.
+        body = json.loads(msg["Body"])
+        assert body["source"] == source
+        assert body["detail"] == {"n": 1}
+        attrs = msg["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "ERROR_FROM_TARGET"
+        assert attrs["EXHAUSTED_RETRY_CONDITION"]["StringValue"] == "MaximumRetryAttempts"
+        assert attrs["RULE_ARN"]["StringValue"].startswith("arn:aws:events:")
+        assert ":rule/" in attrs["RULE_ARN"]["StringValue"]
+        assert attrs["TARGET_ARN"]["StringValue"].startswith("arn:aws:events:")
+        assert ":api-destination/" in attrs["TARGET_ARN"]["StringValue"]
+        assert "ERROR_MESSAGE" in attrs
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_connection_failure_dead_letters(eb, sqs):
+    """An unreachable endpoint dead-letters as CONNECTION_FAILURE with the
+    exhausted-retry condition (the network-error class of eb-rule-dlq)."""
+    import socket
+
+    # Grab a port that nothing is listening on so the connect is refused.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+
+    q_url = sqs.create_queue(QueueName="qa-eb-connfail-dlq-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    bus_name, source = _api_dest_pipeline(
+        eb,
+        "connfail",
+        f"http://127.0.0.1:{dead_port}/unreachable",
+        "API_KEY",
+        {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+        target_extras={"DeadLetterConfig": {"Arn": q_arn}},
+    )
+    eb.put_events(Entries=[{
+        "Source": source,
+        "DetailType": "Ping",
+        "Detail": json.dumps({"n": 1}),
+        "EventBusName": bus_name,
+    }])
+
+    messages = []
+
+    def _drain():
+        resp = sqs.receive_message(
+            QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+        )
+        messages.extend(resp.get("Messages", []))
+        return len(messages) >= 1
+
+    assert _wait_until(_drain)
+    attrs = messages[0]["MessageAttributes"]
+    assert attrs["ERROR_CODE"]["StringValue"] == "CONNECTION_FAILURE"
+    assert attrs["EXHAUSTED_RETRY_CONDITION"]["StringValue"] == "MaximumRetryAttempts"
+    assert json.loads(messages[0]["Body"])["source"] == source
+
+
+def test_eventbridge_api_destination_non_retryable_4xx_dead_letters_without_retry(eb, sqs):
+    """A 404 is outside the documented retryable class (401/407/409/429/5xx):
+    exactly one request is made and the event dead-letters WITHOUT the
+    exhausted-retry condition."""
+    server, captured = _start_api_dest_capture_server(status_plan=[404])
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-nonretry-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "nonretry",
+            f"http://127.0.0.1:{port}/missing",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+            target_extras={"DeadLetterConfig": {"Arn": q_arn}},
+        )
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        # Delivery finished (the DLQ message proves it) — and made ONE attempt.
+        assert len(captured) == 1
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "ERROR_FROM_TARGET"
+        assert attrs["ERROR_MESSAGE"]["StringValue"] == "HTTP 404"
+        assert "EXHAUSTED_RETRY_CONDITION" not in attrs
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_api_destination_deleted_destination_dead_letters_no_resource(eb, sqs):
+    """A target whose API destination no longer exists dead-letters as
+    NO_RESOURCE without any HTTP request being made."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-deldest-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        bus_name, source = _api_dest_pipeline(
+            eb,
+            "deldest",
+            f"http://127.0.0.1:{port}/hook",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k-1"}},
+            target_extras={"DeadLetterConfig": {"Arn": q_arn}},
+        )
+        eb.delete_api_destination(Name="qa-eb-apidest-deldest-dest")
+        eb.put_events(Entries=[{
+            "Source": source,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_name,
+        }])
+
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "NO_RESOURCE"
+        assert "EXHAUSTED_RETRY_CONDITION" not in attrs
+        assert len(captured) == 0
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_connection_secret_arn_and_sanitized_describe(eb, sm):
+    conn_name = "qa-eb-conn-secret"
+    eb.create_connection(
+        Name=conn_name,
+        AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+        AuthParameters={
+            "OAuthParameters": {
+                "AuthorizationEndpoint": "https://issuer.example.test/oauth/token",
+                "HttpMethod": "POST",
+                "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec-hidden"},
+                "OAuthHttpParameters": {
+                    "BodyParameters": [
+                        {"Key": "grant_type", "Value": "client_credentials", "IsValueSecret": False},
+                        {"Key": "totp_seed", "Value": "seed-hidden", "IsValueSecret": True},
+                    ]
+                },
+            },
+            "InvocationHttpParameters": {
+                "HeaderParameters": [
+                    {"Key": "Content-Type", "Value": "application/cloudevents+json", "IsValueSecret": False}
+                ]
+            },
+        },
+    )
+    try:
+        desc = eb.describe_connection(Name=conn_name)
+        # Real EventBridge stores the auth parameters in a Secrets Manager
+        # secret named events!connection/<name>/<uuid> and returns its ARN.
+        secret_arn = desc["SecretArn"]
+        assert secret_arn.startswith("arn:aws:secretsmanager:")
+        assert "events!connection/" + conn_name in secret_arn
+        # The describe response carries NO secret material (response-shape parity).
+        serialized = json.dumps(desc, default=str)
+        assert "ClientSecret" not in serialized
+        assert "csec-hidden" not in serialized
+        assert "seed-hidden" not in serialized
+        oauth = desc["AuthParameters"]["OAuthParameters"]
+        assert oauth["ClientParameters"] == {"ClientID": "cid"}
+        body_params = {p["Key"]: p for p in oauth["OAuthHttpParameters"]["BodyParameters"]}
+        assert body_params["grant_type"]["Value"] == "client_credentials"
+        assert body_params["totp_seed"]["IsValueSecret"] is True
+        assert "Value" not in body_params["totp_seed"]
+
+        # The backing secret holds the full auth parameters for local debugging.
+        stored = json.loads(sm.get_secret_value(SecretId=secret_arn)["SecretString"])
+        assert stored["OAuthParameters"]["ClientParameters"]["ClientSecret"] == "csec-hidden"
+    finally:
+        eb.delete_connection(Name=conn_name)
+    # Deleting the connection deletes its backing secret, as on AWS.
+    with pytest.raises(ClientError) as err:
+        sm.get_secret_value(SecretId=secret_arn)
+    assert err.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_eventbridge_logs_target_delivery(eb, logs):
+    group_name = "qa-eb-logs-target-group"
+    logs.create_log_group(logGroupName=group_name)
+    group_arn = logs.describe_log_groups(logGroupNamePrefix=group_name)["logGroups"][0]["arn"]
+    bus_name = "qa-eb-logs-target-bus"
+    source = "myapp.apidest.logs"
+    eb.create_event_bus(Name=bus_name)
+    eb.put_rule(
+        Name="qa-eb-logs-target-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": [source]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-logs-target-rule",
+        EventBusName=bus_name,
+        Targets=[{"Id": "t1", "Arn": group_arn}],
+    )
+    eb.put_events(Entries=[{
+        "Source": source,
+        "DetailType": "Observed",
+        "Detail": json.dumps({"k": "v"}),
+        "EventBusName": bus_name,
+    }])
+
+    streams = logs.describe_log_streams(logGroupName=group_name)["logStreams"]
+    assert len(streams) == 1
+    events = logs.get_log_events(
+        logGroupName=group_name, logStreamName=streams[0]["logStreamName"]
+    )["events"]
+    assert len(events) == 1
+    envelope = json.loads(events[0]["message"])
+    assert envelope["source"] == source
+    assert envelope["detail-type"] == "Observed"
+    assert envelope["detail"] == {"k": "v"}
+
+
+def test_eventbridge_archive_kms_key_identifier_round_trip(eb):
+    bus_name = "qa-eb-archive-kms-bus"
+    resp = eb.create_event_bus(Name=bus_name)
+    key_arn = "arn:aws:kms:us-east-1:000000000000:key/qa-eb-archive-kms"
+    eb.create_archive(
+        ArchiveName="qa-eb-archive-kms",
+        EventSourceArn=resp["EventBusArn"],
+        RetentionDays=7,
+        KmsKeyIdentifier=key_arn,
+    )
+    desc = eb.describe_archive(ArchiveName="qa-eb-archive-kms")
+    assert desc["KmsKeyIdentifier"] == key_arn
+    assert desc["RetentionDays"] == 7
+
+
+def test_eventbridge_name_length_caps():
+    """Server-side name caps (archive 48, connection/API destination 64) — what
+    non-validating SDKs like the Terraform provider hit at apply time. botocore
+    enforces the same caps client-side, so validation is disabled here to reach
+    the API."""
+    from conftest import make_client
+
+    eb_raw = make_client("events", {"parameter_validation": False})
+
+    with pytest.raises(ClientError) as err:
+        eb_raw.create_archive(
+            ArchiveName="a" * 49,
+            EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"
+
+    with pytest.raises(ClientError) as err:
+        eb_raw.create_connection(
+            Name="c" * 65,
+            AuthorizationType="API_KEY",
+            AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-K", "ApiKeyValue": "v"}},
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"
+
+    with pytest.raises(ClientError) as err:
+        eb_raw.create_api_destination(
+            Name="d" * 65,
+            ConnectionArn="arn:aws:events:us-east-1:000000000000:connection/qa-eb-cap-conn",
+            InvocationEndpoint="https://example.test/hook",
+            HttpMethod="POST",
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_eventbridge_rule_pattern_partnerid_exists_null_counts_as_present(eb, sqs):
+    """The cloudevents-binding pattern: detail-type match + detail.partnerid
+    {exists: true}. AWS nuance verified against the live matcher: a JSON null
+    partnerid counts as PRESENT, only a truly absent key fails the match."""
+    bus_name = "qa-eb-exists-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName="qa-eb-exists-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name="qa-eb-exists-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({
+            "detail-type": ["com.example.order.created.v1"],
+            "detail": {"partnerid": [{"exists": True}]},
+        }),
+        State="ENABLED",
+    )
+    eb.put_targets(Rule="qa-eb-exists-rule", EventBusName=bus_name, Targets=[{"Id": "t1", "Arn": q_arn}])
+
+    entries = [
+        {"marker": "with", "partnerid": "8c2d4e61-9a03-4f7b-b1e8-6d5c3a9f2b14"},
+        {"marker": "absent"},
+        {"marker": "null", "partnerid": None},
+    ]
+    eb.put_events(Entries=[
+        {
+            "Source": "myapp.exists",
+            "DetailType": "com.example.order.created.v1",
+            "Detail": json.dumps(detail),
+            "EventBusName": bus_name,
+        }
+        for detail in entries
+    ])
+
+    markers = set()
+    deadline = time.time() + 5
+    while time.time() < deadline and len(markers) < 2:
+        for msg in sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", []):
+            markers.add(json.loads(msg["Body"])["detail"]["marker"])
+    assert markers == {"with", "null"}
+
+
+def test_eventbridge_api_destination_bare_object_template_dead_letters_invalid_json(eb, sqs):
+    """A template placing an object variable outside a JSON value position
+    (bare <detail>) fails the invocation BEFORE any HTTP request and
+    dead-letters as INVALID_JSON — the wrapped form {"detail": <detail>}
+    still delivers."""
+    server, captured = _start_api_dest_capture_server()
+    try:
+        port = server.server_address[1]
+        q_url = sqs.create_queue(QueueName="qa-eb-invjson-dlq-q")["QueueUrl"]
+        q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+        bus_bare, source_bare = _api_dest_pipeline(
+            eb,
+            "invjson-bare",
+            f"http://127.0.0.1:{port}/bare",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+            target_extras={
+                "InputTransformer": {"InputPathsMap": {"detail": "$.detail"}, "InputTemplate": "<detail>"},
+                "DeadLetterConfig": {"Arn": q_arn},
+            },
+        )
+        bus_wrapped, source_wrapped = _api_dest_pipeline(
+            eb,
+            "invjson-wrapped",
+            f"http://127.0.0.1:{port}/wrapped",
+            "API_KEY",
+            {"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+            target_extras={
+                "InputTransformer": {
+                    "InputPathsMap": {"detail": "$.detail"},
+                    "InputTemplate": '{"detail": <detail>}',
+                },
+            },
+        )
+
+        eb.put_events(Entries=[{
+            "Source": source_bare,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 1}),
+            "EventBusName": bus_bare,
+        }])
+        eb.put_events(Entries=[{
+            "Source": source_wrapped,
+            "DetailType": "Ping",
+            "Detail": json.dumps({"n": 2}),
+            "EventBusName": bus_wrapped,
+        }])
+
+        # The wrapped form delivers; the bare form never reaches the endpoint.
+        assert _wait_until(lambda: len(captured) >= 1)
+        assert len(captured) == 1
+        assert captured[0]["path"] == "/wrapped"
+        assert json.loads(captured[0]["body"]) == {"detail": {"n": 2}}
+
+        messages = []
+
+        def _drain():
+            resp = sqs.receive_message(
+                QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1, MessageAttributeNames=["All"]
+            )
+            messages.extend(resp.get("Messages", []))
+            return len(messages) >= 1
+
+        assert _wait_until(_drain)
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["ERROR_CODE"]["StringValue"] == "INVALID_JSON"
+        assert attrs["ERROR_MESSAGE"]["StringValue"] == "Invalid input for target."
+        # The DLQ body is the original envelope.
+        assert json.loads(messages[0]["Body"])["detail"] == {"n": 1}
+    finally:
+        server.shutdown()
+
+
+def test_eventbridge_put_targets_rejects_invalid_json_input(eb):
+    bus_name = "qa-eb-input-validation-bus"
+    eb.create_event_bus(Name=bus_name)
+    eb.put_rule(
+        Name="qa-eb-input-validation-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": ["myapp.input-validation"]}),
+        State="ENABLED",
+    )
+    with pytest.raises(ClientError) as err:
+        eb.put_targets(
+            Rule="qa-eb-input-validation-rule",
+            EventBusName=bus_name,
+            Targets=[{
+                "Id": "t1",
+                "Arn": "arn:aws:sqs:us-east-1:000000000000:qa-eb-input-validation-q",
+                "Input": "not json {",
+            }],
+        )
+    assert err.value.response["Error"]["Code"] == "ValidationException"
