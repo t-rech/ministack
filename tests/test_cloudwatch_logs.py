@@ -1503,6 +1503,30 @@ def test_destinations_survive_warm_boot():
     mod.reset()
 
 
+# ── _resource_policies ─────────────────────────────────────────────────
+
+def test_resource_policies_survive_warm_boot():
+    mod = _module()
+    mod.reset()
+    mod._resource_policies["events-delivery"] = {
+        "policyName": "events-delivery",
+        "policyDocument": '{"Version": "2012-10-17", "Statement": []}',
+        "lastUpdatedTime": 1700000000000,
+        "policyScope": "ACCOUNT",
+    }
+
+    _round_trip(mod)
+
+    assert "events-delivery" in mod._resource_policies, (
+        "CloudWatch Logs resource policy lost across get_state → restore_state — "
+        "_resource_policies must be in both."
+    )
+    # The quota counts restored policies too: a warm boot that forgot them would
+    # silently hand the account ten fresh slots.
+    assert len(mod._resource_policies) == 1
+    mod.reset()
+
+
 # ── _metric_filters ────────────────────────────────────────────────────
 
 def test_metric_filters_survive_warm_boot():
@@ -1779,3 +1803,88 @@ def test_logs_delivery_source_tag_round_trip(logs):
     logs.untag_resource(resourceArn=arn, tagKeys=["env"])
     assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"team": "events"}
     logs.delete_delivery_source(name=src_name)
+
+
+# ---------------------------------------------------------------------------
+# Resource policies
+# ---------------------------------------------------------------------------
+
+# AWS's documented, non-adjustable quota — asserted here rather than imported so
+# the test fails if the service constant drifts away from the published limit.
+_MAX_POLICIES = 10
+
+
+def _events_delivery_policy_doc(name):
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowEventBridgeLogDelivery",
+            "Effect": "Allow",
+            "Principal": {"Service": "events.amazonaws.com"},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": f"arn:aws:logs:us-east-1:000000000000:log-group:/qa/{name}:*",
+        }],
+    })
+
+
+def test_logs_resource_policy_round_trip(logs):
+    name = "qa-logs-respolicy-rt"
+    put = logs.put_resource_policy(policyName=name, policyDocument=_events_delivery_policy_doc(name))
+    try:
+        assert put["resourcePolicy"]["policyName"] == name
+        assert "lastUpdatedTime" in put["resourcePolicy"]
+        assert put["resourcePolicy"]["policyScope"] == "ACCOUNT"
+
+        described = logs.describe_resource_policies()["resourcePolicies"]
+        match = [p for p in described if p["policyName"] == name]
+        assert len(match) == 1
+        assert "events.amazonaws.com" in match[0]["policyDocument"]
+    finally:
+        logs.delete_resource_policy(policyName=name)
+    remaining = logs.describe_resource_policies()["resourcePolicies"]
+    assert not [p for p in remaining if p["policyName"] == name]
+
+
+def test_logs_resource_policy_rejects_malformed_input(logs):
+    """policyName and a JSON policyDocument are required, and a delete that
+    names nothing is a validation error rather than a missing-policy report."""
+    with pytest.raises(ClientError) as err:
+        logs.put_resource_policy(policyName="qa-logs-respolicy-bad", policyDocument="{not json")
+    assert err.value.response["Error"]["Code"] == "InvalidParameterException"
+
+    with pytest.raises(ClientError) as err:
+        logs.delete_resource_policy()
+    assert err.value.response["Error"]["Code"] == "InvalidParameterException"
+
+    with pytest.raises(ClientError) as err:
+        logs.delete_resource_policy(policyName="qa-logs-respolicy-missing")
+    assert err.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_logs_resource_policy_limit_of_ten(logs):
+    """AWS allows 10 resource policies per account/region (not adjustable); the
+    11th draws LimitExceededException — the wall per-bus policy designs hit."""
+    existing = {p["policyName"] for p in logs.describe_resource_policies()["resourcePolicies"]}
+    created = []
+    try:
+        for i in range(_MAX_POLICIES - len(existing)):
+            name = f"qa-logs-respolicy-limit-{i}"
+            logs.put_resource_policy(policyName=name, policyDocument=_events_delivery_policy_doc(name))
+            created.append(name)
+        # Stated as a precondition so a saturated account fails here, with a
+        # readable count, rather than downstream on an empty `created`.
+        assert len(logs.describe_resource_policies()["resourcePolicies"]) == _MAX_POLICIES
+
+        with pytest.raises(ClientError) as err:
+            logs.put_resource_policy(
+                policyName="qa-logs-respolicy-limit-overflow",
+                policyDocument=_events_delivery_policy_doc("overflow"),
+            )
+        assert err.value.response["Error"]["Code"] == "LimitExceededException"
+
+        # Updating an EXISTING policy at the limit is still allowed.
+        at_limit = created[0] if created else sorted(existing)[0]
+        logs.put_resource_policy(policyName=at_limit, policyDocument=_events_delivery_policy_doc("updated"))
+    finally:
+        for name in created:
+            logs.delete_resource_policy(policyName=name)
