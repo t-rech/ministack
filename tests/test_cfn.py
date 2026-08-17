@@ -6725,8 +6725,12 @@ def test_cfn_logs_subscription_filter_provisions(cfn, logs):
         logs.describe_subscription_filters(logGroupName="/cfn/subfilter-test")
 
 
-def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
-    """Logs resource policies expose their policy name without enforcing it."""
+def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn, logs):
+    """Logs resource policies expose their policy name, and land in the same
+    store DescribeResourcePolicies reads, without being enforced."""
+    def policy_names():
+        return {p["policyName"] for p in logs.describe_resource_policies()["resourcePolicies"]}
+
     suffix = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-logs-policy-{suffix}"
     policy_name = f"logs-policy-{suffix}"
@@ -6764,6 +6768,10 @@ def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
     assert stack["Outputs"][0]["OutputValue"] == policy_name
+    assert policy_name in policy_names(), (
+        "a stack-provisioned resource policy must be readable through "
+        "DescribeResourcePolicies, or terraform/CLI refresh cannot see it"
+    )
 
     cfn.update_stack(
         StackName=stack_name,
@@ -6772,6 +6780,10 @@ def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
     assert stack["Outputs"][0]["OutputValue"] == policy_name
+    described = [p for p in logs.describe_resource_policies()["resourcePolicies"]
+                 if p["policyName"] == policy_name]
+    assert len(described) == 1
+    assert "UpdatedPolicy" in described[0]["policyDocument"]
 
     updated_name = f"{policy_name}-updated"
     cfn.update_stack(
@@ -6781,10 +6793,17 @@ def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
     assert stack["Outputs"][0]["OutputValue"] == updated_name
+    names = policy_names()
+    assert updated_name in names
+    assert policy_name not in names, (
+        "renaming the policy must not orphan the old one — it would hold one of "
+        "the ten per-account slots with no stack resource pointing at it"
+    )
 
     cfn.delete_stack(StackName=stack_name)
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "DELETE_COMPLETE"
+    assert updated_name not in policy_names()
 
 
 def test_cfn_kinesisfirehose_delivery_stream_shares_firehose_state(cfn, fh):

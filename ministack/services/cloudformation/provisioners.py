@@ -1329,17 +1329,41 @@ def _cwlogs_resource_policy_create(logical_id, props, stack_name):
     policy_name = props.get("PolicyName")
     if not policy_name:
         raise ValueError("AWS::Logs::ResourcePolicy requires PolicyName")
-    # Local log delivery is intentionally permissive, so the policy only needs
-    # its CloudFormation identity rather than a data-plane enforcement store.
+    # Local log delivery stays intentionally permissive — nothing reads this
+    # policy to authorize a write. It goes through PutResourcePolicy so the
+    # stack's policy is the same one DescribeResourcePolicies answers with and
+    # counts against the same 10-per-account quota; a template that provisions
+    # a policy CloudFormation cannot read back is the inconsistency to avoid.
+    document = props.get("PolicyDocument")
+    status, _headers, body = _cw_logs._put_resource_policy({
+        "policyName": policy_name,
+        "policyDocument": json.dumps(document) if isinstance(document, dict) else document,
+    })
+    if status >= 400:
+        # Busting the quota fails the resource, and with it the stack, exactly
+        # as the LimitExceededException from AWS would.
+        raise ValueError(
+            f"AWS::Logs::ResourcePolicy {policy_name}: "
+            f"{body.decode() if isinstance(body, bytes) else body}"
+        )
     return policy_name, {}
 
 
 def _cwlogs_resource_policy_update(physical_id, old_props, new_props, stack_name):
+    new_name = new_props.get("PolicyName")
+    if new_name and new_name != physical_id:
+        # PolicyName is create-only on AWS, so a change arrives here as the
+        # create-again fallback that stands in for replacement. Drop the policy
+        # under the old name first: it would otherwise be orphaned in the store,
+        # holding one of the ten slots with no stack resource pointing at it.
+        _cw_logs._delete_resource_policy({"policyName": physical_id})
     return _cwlogs_resource_policy_create(physical_id, new_props, stack_name)
 
 
 def _cwlogs_resource_policy_delete(physical_id, props):
-    pass
+    # A rollback can reach this after the policy is already gone; the service
+    # answers ResourceNotFoundException for that, which is nothing to undo.
+    _cw_logs._delete_resource_policy({"policyName": physical_id})
 
 
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
