@@ -172,6 +172,11 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_iot_rule_where_topic_function_under_basic_ingest",
     "tests/test_iot_data.py::test_iot_rule_where_or_clause_dispatches_either_branch",
     "tests/test_iot_data.py::test_iot_jitr_registration_event_drives_a_topic_rule",
+    # Saturates the account/region-wide resource-policy store to its
+    # documented cap of 10 to prove the 11th is refused. A parallel worker
+    # writing a policy of its own would either steal the last slot or make
+    # the overflow attempt succeed, so it runs in the serial phase.
+    "tests/test_cloudwatch_logs.py::test_logs_resource_policy_limit_of_ten",
 }
 
 
